@@ -2959,7 +2959,7 @@ class SolidLanguageServer(ABC):
         to the high-level document symbol information.
 
         Language servers must implement this method/change the return value if
-        the `request_document_symbols` implementation (or any of the methods called by it)
+        the `_build_document_symbols_from_raw_symbols` implementation (or any of the methods called by it)
         are changed to modify the returned content.
 
         Whenever the value changes, the high-level document symbols cache will be invalidated and re-populated.
