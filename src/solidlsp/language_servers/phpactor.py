@@ -4,19 +4,17 @@ Provides PHP specific instantiation of the LanguageServer class using Phpactor.
 
 import logging
 import os
-import pathlib
 import re
 import shutil
 import stat
-import subprocess
 
 from overrides import override
 
 from solidlsp.ls import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath, SolidLanguageServer
-from solidlsp.ls_config import Language, LanguageServerConfig
+from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_utils import FileUtils
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.util.subprocess_util import subprocess_run
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +68,7 @@ class PhpactorServer(SolidLanguageServer):
             )
 
             # Check PHP version (Phpactor requires PHP 8.1+)
-            result = subprocess.run(["php", "--version"], capture_output=True, text=True, check=False)
+            result = subprocess_run(["php", "--version"], capture_output=True, text=True, check=False)
             php_version_output = result.stdout.strip()
             log.info(f"PHP version: {php_version_output}")
             version_match = re.search(r"PHP (\d+)\.(\d+)", php_version_output)
@@ -111,8 +109,6 @@ class PhpactorServer(SolidLanguageServer):
 
     def __init__(self, config: LanguageServerConfig, repository_root_path: str, solidlsp_settings: SolidLSPSettings):
         super().__init__(config, repository_root_path, None, "php", solidlsp_settings)
-        # Override internal language enum for correct file matching
-        self.language = Language.PHP_PHPACTOR
 
         self._ignored_dirnames = {"node_modules", "cache"}
         if self._custom_settings.get("ignore_vendor", True):
@@ -122,15 +118,11 @@ class PhpactorServer(SolidLanguageServer):
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         return self.DependencyProvider(self._custom_settings, self._ls_resources_dir)
 
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialization params for the Phpactor Language Server.
         """
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
         initialize_params = {
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
             "capabilities": {
                 "textDocument": {
                     "synchronization": {"didSave": True, "dynamicRegistration": True},
@@ -145,19 +137,13 @@ class PhpactorServer(SolidLanguageServer):
                     "didChangeConfiguration": {"dynamicRegistration": True},
                 },
             },
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
             "initializationOptions": {
                 "language_server_phpstan.enabled": False,
                 "language_server_psalm.enabled": False,
                 "language_server_php_cs_fixer.enabled": False,
             },
         }
-        return initialize_params  # type: ignore
+        return initialize_params
 
     def _start_server(self) -> None:
         """Start Phpactor server process."""
@@ -178,7 +164,7 @@ class PhpactorServer(SolidLanguageServer):
 
         log.info("Starting Phpactor server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)

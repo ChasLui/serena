@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import platform
 import signal
+import subprocess
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
@@ -40,13 +41,16 @@ from serena.config.serena_config import (
     ToolInclusionDefinition,
 )
 from serena.dashboard import SerenaDashboardAPI, SerenaDashboardTrayManager, SerenaDashboardViewer, open_url_in_browser
+from serena.jetbrains import launch_coordinator as jetbrains_launch_coordinator
 from serena.ls_manager import LanguageServerManager
-from serena.project import MemoriesManager, Project
+from serena.memories.memory_manager import MemoryManager
+from serena.project import Project
 from serena.prompt_factory import SerenaPromptFactory
 from serena.task_executor import TaskExecutor
 from serena.tools import (
     ActivateProjectTool,
     GetCurrentConfigTool,
+    OnboardingTool,
     OpenDashboardTool,
     ReadMemoryTool,
     ReplaceContentTool,
@@ -57,7 +61,9 @@ from serena.tools import (
 from serena.util.gui import system_has_usable_display
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
-from solidlsp.ls_config import Language
+from solidlsp.ls_config import LanguageServerId
+from solidlsp.util import subprocess_util
+from solidlsp.util.subprocess_util import terminate_process_tree_with_kill_fallback
 
 if TYPE_CHECKING:
     from serena.gui_log_viewer import GuiLogViewer
@@ -205,7 +211,12 @@ class ToolSet:
 class ActiveModes:
     _mode_instances: dict[str, SerenaAgentMode] = {}
 
-    def __init__(self) -> None:
+    def __init__(self, background_base_modes: Sequence[SerenaAgentMode] | None = None) -> None:
+        """
+        :param background_base_modes: base modes that are always active in the background and will not be removed
+            by applications of mode selection definitions via method `apply`
+        """
+        self._background_base_modes = background_base_modes or []
         self._configured_base_modes: Sequence[str] | None = None
         self._configured_default_modes: Sequence[str] | None = None
         self._added_modes: set[str] = set()
@@ -215,7 +226,7 @@ class ActiveModes:
         """
         self._active_mode_names: Sequence[str] = []
         """
-        the full list of active mode names
+        the full list of active mode names (not including background base modes)
         """
 
     def apply(self, mode_selection: ModeSelectionDefinition) -> None:
@@ -240,6 +251,9 @@ class ActiveModes:
         self._active_mode_names = sorted(set(self._configured_base_modes or []) | self._dynamically_activated_mode_names)
 
     def get_mode_names(self) -> Sequence[str]:
+        """
+        :return: the ordered list of active mode names (not including the non-user-facing background base modes)
+        """
         return self._active_mode_names
 
     @classmethod
@@ -248,14 +262,22 @@ class ActiveModes:
             cls._mode_instances[mode_name] = SerenaAgentMode.load(mode_name)
         return cls._mode_instances[mode_name]
 
-    def get_modes(self) -> Sequence[SerenaAgentMode]:
-        return [self.get_mode_instance(mode_name) for mode_name in self._active_mode_names]
+    def get_modes(self, include_background_base_modes: bool = False) -> Sequence[SerenaAgentMode]:
+        result: list[SerenaAgentMode] = []
+        if include_background_base_modes:
+            result.extend(self._background_base_modes)
+        result.extend([self.get_mode_instance(mode_name) for mode_name in self._active_mode_names])
+        return result
 
     def get_dynamically_activated_modes(self) -> Sequence[SerenaAgentMode]:
         return [self.get_mode_instance(mode_name) for mode_name in self._dynamically_activated_mode_names]
 
-    def get_base_modes(self) -> Sequence[SerenaAgentMode]:
-        return [self.get_mode_instance(mode_name) for mode_name in self._configured_base_modes or []]
+    def get_base_modes(self, include_background_base_modes: bool = False) -> Sequence[SerenaAgentMode]:
+        result: list[SerenaAgentMode] = []
+        if include_background_base_modes:
+            result.extend(self._background_base_modes)
+        result.extend([self.get_mode_instance(mode_name) for mode_name in self._configured_base_modes or []])
+        return result
 
 
 class ProjectPromptProvisionStatus:
@@ -366,8 +388,7 @@ class DashboardManager:
                 case "Windows":
                     return cls.WEBVIEW
                 case "Darwin":
-                    # TODO: Switch to TRAY_MANAGER once support is tested
-                    return cls.BROWSER
+                    return cls.TRAY_MANAGER
                 case _:
                     return cls.BROWSER
 
@@ -518,7 +539,9 @@ class SerenaAgent:
     def __init__(
         self,
         project: str | None = None,
+        *,
         project_activation_callback: Callable[[], None] | None = None,
+        project_activation_error: str | None = None,
         serena_config: SerenaConfig | None = None,
         context: SerenaAgentContext | None = None,
         modes: ModeSelectionDefinition | None = None,
@@ -528,6 +551,8 @@ class SerenaAgent:
         :param project: the project to load immediately or None to not load any project; may be a path to the project or a name of
             an already registered project;
         :param project_activation_callback: a callback function to be called when a project is activated.
+        :param project_activation_error: an initial error to report back to the client/LLM pertaining to project determination/activation
+            in Serena's initial prompts. This is only applicable if `project` is None.
         :param serena_config: the Serena configuration or None to read the configuration from the default location.
         :param context: the context in which the agent is operating, None for default context.
             The context may adjust prompts, tool availability, and tool descriptions.
@@ -535,23 +560,21 @@ class SerenaAgent:
         :param memory_log_handler: a MemoryLogHandler instance from which to read log messages; if None, a new one will be created
             if necessary.
         """
-        self._active_project: Project | None = None
+        self._active_project: Project | None = None  # NOTE: field name used in __del__
         self._project_activation_callback = project_activation_callback
+        self._project_activation_error: str | None = project_activation_error
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
         self._dashboard_manager: DashboardManager | None = None
         self._project_prompt_status = ProjectPromptProvisionStatus()
         self._session_mode_selection_definition = modes
         self.version = serena_version()
+        self._config_changed_callbacks: list[Callable[[], None]] = []
 
         # obtain serena configuration using the decoupled factory function
         self.serena_config = serena_config or SerenaConfig.from_config_file()
 
         # propagate configuration to other components
         self.serena_config.propagate_settings()
-
-        # initialise active modes (baseline modes prior to project activation)
-        self._active_modes: ActiveModes
-        self._update_active_modes(log_message=False)
 
         # determine registered project to be activated (if any)
         registered_project_to_activate: RegisteredProject | None = (
@@ -622,19 +645,24 @@ class SerenaAgent:
         # determine the effective language backend for this session.
         # If a startup project is provided and has a per-project override, use it; otherwise use the global config.
         # Since we don't want to change the toolset after startup, the language backend cannot be changed within a running Serena session
-        self._language_backend = self.serena_config.language_backend
-        if registered_project_to_activate is not None and registered_project_to_activate.project_config.language_backend is not None:
-            self._language_backend = registered_project_to_activate.project_config.language_backend
-            log.info(f"Using language backend as configured in project.yml: {self._language_backend.name}")
-        else:
-            log.info(f"Using language backend from global configuration: {self._language_backend.name}")
+        self._language_backend = self.serena_config.determine_language_backend(
+            project_config=registered_project_to_activate.project_config if registered_project_to_activate is not None else None,
+            log_choice=True,
+        )
+
+        # create the tool names mapping for prompts
+        self._prompt_tool_names_mapping = self._create_prompt_tool_names_mapping(self._language_backend)
 
         # create executor for starting the language server and running tools in another thread
         # This executor is used to achieve linear task execution
-        self._task_executor = TaskExecutor("SerenaAgentTaskExecutor")
+        self._task_executor = TaskExecutor("SerenaAgentTaskExecutor", self._task_completion_callback)
 
         # Initialize the prompt factory
         self.prompt_factory = SerenaPromptFactory()
+
+        # initialise active modes (baseline modes prior to project activation, allowing newly activated modes to be tracked)
+        self._active_modes: ActiveModes
+        self._update_active_modes(log_message=False)
 
         # activate the given project (if any), also updating the active modes
         # Note: We cannot update the active tools yet, because the base toolset has not been computed yet
@@ -644,12 +672,11 @@ class SerenaAgent:
                 self.activate_project_from_path_or_name(project, update_active_modes=False, update_active_tools=False)
             except Exception as e:
                 log.error(f"Error activating project '{project}' at startup: {e}", exc_info=e)
+                self._project_activation_error = str(e)
         self._update_active_modes()
 
         # determine the base toolset defining the set of exposed tools (which e.g. the MCP shall see),
-        self._base_toolset = self._create_base_toolset(
-            self.serena_config, self._language_backend, self._context, self._active_modes, self._active_project
-        )
+        self._base_toolset = self._create_base_toolset(self.serena_config, self._context, self._active_modes, self._active_project)
         self._exposed_tools = self._base_toolset.to_available_tools(self._all_tools)
         log.info(f"Number of exposed tools: {len(self._exposed_tools)}. Exposed tools: {self._exposed_tools.tool_names}")
 
@@ -657,13 +684,29 @@ class SerenaAgent:
         self._active_tools: AvailableTools
         self._update_active_tools()
 
-        # start the dashboard (web frontend), registering its log handler
-        # should be the last thing to happen in the initialization since the dashboard
-        # may access various parts of the agent
+        # create the dashboard backend (if enabled), which will register callback.
+        dashboard_api: SerenaDashboardAPI | None = None
         if self.serena_config.web_dashboard:
-            self._dashboard_thread, port = SerenaDashboardAPI(
-                get_memory_log_handler(), tool_names, agent=self, tool_usage_stats=self._tool_usage_stats
-            ).run_in_thread(host=self.serena_config.web_dashboard_listen_address)
+            dashboard_api = SerenaDashboardAPI(
+                get_memory_log_handler(),
+                tool_names,
+                agent=self,
+                tool_usage_stats=self._tool_usage_stats,
+                host=self.serena_config.web_dashboard_listen_address,
+                trusted_hosts=self.serena_config.web_dashboard_trusted_hosts,
+            )
+
+        # propagate the initial config/state to listeners, particularly to the dashboard API.
+        # Note: The only ongoing task can be the LS initialisation, which does not change the config
+        # This is executed before starting the dashboard thread to ensure that the dashboard
+        # has the correct initial state before requests can come in.
+        self._on_config_changed()
+
+        # start the dashboard backend thread and the dashboard frontend manager (if enabled).
+        # This should be the last thing to happen in the initialization since the dashboard
+        # may access various parts of the agent
+        if dashboard_api:
+            dashboard_thread, port = dashboard_api.run_in_thread()
             self._dashboard_manager = DashboardManager(
                 port,
                 self.serena_config.web_dashboard_listen_address,
@@ -697,7 +740,6 @@ class SerenaAgent:
     def _create_base_toolset(
         cls,
         serena_config: SerenaConfig,
-        language_backend: LanguageBackend,
         context: SerenaAgentContext,
         modes: ActiveModes,
         project: Project | None,
@@ -708,9 +750,9 @@ class SerenaAgent:
            * dashboard availability/opening on launch
            * Serena config
            * the context (which is fixed for the session)
-           * the optional tools enabled by initial modes
+           * the base modes (including background base modes like JetBrains mode)
+           * the optional tools enabled by initial dynamic modes
            * single-project mode reductions (if applicable)
-           * JetBrains mode
         """
         # determine whether to include the OpenDashboardTool based on the Serena configuration
         tool_inclusion_definitions: list[ToolInclusionDefinition] = []
@@ -729,7 +771,7 @@ class SerenaAgent:
 
         # consider modes
         # * base modes: These cannot be changed, so they are fully applied
-        for base_mode in modes.get_base_modes():
+        for base_mode in modes.get_base_modes(include_background_base_modes=True):
             tool_inclusion_definitions.append(base_mode)
         # * dynamically activated modes:
         #    - When not in a single-project context, these modes can later be turned off,
@@ -752,6 +794,7 @@ class SerenaAgent:
         # of tools that will be exposed to the client.
         # Furthermore, we disable tools that are only relevant for project activation.
         # So if the project exists, we apply all the aforementioned exclusions.
+        apply_read_only = False
         if is_single_project:
             assert project is not None
             log.info(
@@ -765,13 +808,12 @@ class SerenaAgent:
                 )
             )
             tool_inclusion_definitions.append(project.project_config)
-
-        # enabled the internal 'jetbrains' mode for the JetBrains backend
-        if language_backend == LanguageBackend.JETBRAINS:
-            tool_inclusion_definitions.append(SerenaAgentMode.from_name_internal("jetbrains"))
+            apply_read_only = project.project_config.read_only
 
         # compute the resulting tool set
         base_toolset = ToolSet.default().apply(*tool_inclusion_definitions)
+        if apply_read_only:
+            base_toolset = base_toolset.without_editing_tools()
         log.info(f"Number of exposed tools: {len(base_toolset)}")
         return base_toolset
 
@@ -890,15 +932,70 @@ class SerenaAgent:
             raise ValueError("No active project. Please activate a project first.")
         return project
 
-    def get_active_modes(self) -> list[SerenaAgentMode]:
+    def get_active_modes(self) -> ActiveModes:
         """
-        :return: the list of active modes
+        :return: the active modes
         """
-        return list(self._active_modes.get_modes())
+        return self._active_modes
 
-    def _format_prompt(self, prompt_template: str) -> str:
+    @staticmethod
+    def _create_prompt_tool_names_mapping(language_backend: LanguageBackend) -> dict[str, str]:
+        """
+        Creates a mapping from tool names to new tool names, which take into consideration
+
+           * legacy tool names, where the name was changed and
+           * LSP tools which are functionally replaced by other tools due to the active language backend
+             (e.g. "find_symbol" being replaced by "jet_brains_find_symbol" in JetBrains mode).
+
+        The mapping is intended to be used for the generation of prompts, such that prompts can
+        refer to tool names as `{{ tool_names["find_symbol"] }}`, and the mapping will ensure that
+        the correct tool name is used in the prompt based on the active language backend.
+
+        :return: the mapping from tool names to new tool names
+        """
+        result = dict(ToolSet.LEGACY_TOOL_NAME_MAPPING)
+        class_replacements = language_backend.get_lsp_tool_class_replacements()
+        for tool_class in ToolRegistry().get_all_tool_classes():
+            new_tool_class: type[Tool] = class_replacements.get(tool_class, tool_class)
+            result[tool_class.get_name_from_cls()] = new_tool_class.get_name_from_cls()
+        return result
+
+    @staticmethod
+    def _format_prompt_tag(text: str, tag: str, tag_name_attr: str | None = None) -> str:
+        open_tag = f"<{tag}" + (f' name="{tag_name_attr}"' if tag_name_attr is not None else "") + ">"
+        close_tag = f"</{tag}>"
+        return f"{open_tag}\n{text.strip()}\n{close_tag}"
+
+    def _render_prompt(self, prompt_template: str, tag: str | None = None, tag_name_attr: str | None = None) -> str:
+        """
+        Renders the given prompt template, providing the necessary variables and functions
+
+        :param prompt_template: the template text (jinja2) to render
+        :param tag: if not None, wraps the rendered prompt text in a tag
+        :param tag_name_attr: for the case where tag is not None, specifies the value of the "name" attribute of the tag
+        :return: the rendered prompt
+        """
+
+        def embed_memory(memory_name: str) -> str:
+            try:
+                memory_manager = self._get_memory_manager()
+                return self._format_prompt_tag(memory_manager.load_memory(memory_name), tag="memory", tag_name_attr=memory_name)
+            except Exception as e:
+                log.error("Tried to embed memory '%s' but failed to load it: %s", memory_name, e)
+                return ""
+
         template = JinjaTemplate(prompt_template)
-        return template.render(available_tools=self._exposed_tools.tool_names, available_markers=self._exposed_tools.tool_marker_names)
+        text = template.render(
+            available_tools=self._exposed_tools.tool_names,
+            available_markers=self._exposed_tools.tool_marker_names,
+            tool_names=self._prompt_tool_names_mapping,
+            embed_memory=embed_memory,
+        )
+
+        if tag is not None:
+            text = self._format_prompt_tag(text, tag=tag, tag_name_attr=tag_name_attr)
+
+        return text
 
     def create_connection_prompt(self) -> str:
         """
@@ -907,6 +1004,21 @@ class SerenaAgent:
         :return: the prompt
         """
         return self.prompt_factory.create_connection_prompt()
+
+    def _create_global_memory_manager(self) -> MemoryManager:
+        """
+        :return: a memory manager for global memories only (no project memories)
+        """
+        return MemoryManager(serena_data_folder=None, read_only_memory_patterns=self.serena_config.read_only_memory_patterns)
+
+    def _get_memory_manager(self) -> MemoryManager:
+        """
+        :return: the memory manager for the active project (if any) or a global memory manager if no project is active
+        """
+        if self._active_project is not None:
+            return self._active_project.memory_manager
+        else:
+            return self._create_global_memory_manager()
 
     def create_system_prompt(self, session_id: str = "global") -> str:
         """
@@ -917,34 +1029,35 @@ class SerenaAgent:
         """
         available_tools = self._active_tools
         available_markers = available_tools.tool_marker_names
-        global_memories = MemoriesManager(
-            serena_data_folder=None, read_only_memory_patterns=self.serena_config.read_only_memory_patterns
-        ).list_global_memories()
+        global_memories = self._create_global_memory_manager().list_global_memories()
         global_memories_str = dict_string(global_memories.to_dict()) if len(global_memories) > 0 else ""
         log.info("Generating system prompt with available_tools=(see active tools), available_markers=%s", available_markers)
 
         # determine modes for which prompts must (still) be provided, excluding modes that were already provided in a
         # previously provided project activation message (if any)
         relevant_modes = []
-        for mode in self.get_active_modes():
+        for mode in self.get_active_modes().get_modes(include_background_base_modes=True):
             if mode.has_prompt():
                 if not self._project_prompt_status.is_mode_prompt_already_provided(mode.name, session_id):
                     relevant_modes.append(mode)
         self._project_prompt_status.mark_mode_prompts_as_provided(session_id)
 
         system_prompt = self.prompt_factory.create_system_prompt(
-            context_system_prompt=self._format_prompt(self._context.prompt),
-            mode_system_prompts=[self._format_prompt(mode.prompt) for mode in relevant_modes],
+            context_system_prompt=self._render_prompt(self._context.prompt, tag="context"),
+            mode_system_prompts=[self._render_prompt(mode.prompt, tag="mode", tag_name_attr=mode.name) for mode in relevant_modes],
             available_tools=available_tools.tool_names,
             available_markers=available_markers,
             global_memories_list=global_memories_str,
+            tool_names=self._prompt_tool_names_mapping,
         )
 
         # provide the project activation message if it hasn't yet been provided
         if self._active_project is not None and not self._project_prompt_status.is_project_activation_message_already_provided(session_id):
-            system_prompt += "\n\n" + self.get_project_activation_message(session_id)
+            system_prompt += "\n\n" + self._format_prompt_tag(self.get_project_activation_message(session_id), tag="active-project")
+        elif self._project_activation_error:
+            system_prompt += f"\n\nNo project is active ({self._project_activation_error})."
 
-        return system_prompt
+        return self._format_prompt_tag(system_prompt, tag="serena")
 
     def get_project_activation_message(self, session_id: str) -> str:
         """
@@ -964,35 +1077,36 @@ class SerenaAgent:
 
         # provide basic project information (name, location, languages, encoding)
         if proj.is_newly_created:
-            msg = f"Created and activated a new project with name '{proj.project_name}' at {proj.project_root}. "
+            msg = f"Created and activated a new project with name '{proj.project_name}' at {proj.project_root}.\n"
         else:
-            msg = f"The project with name '{proj.project_name}' at {proj.project_root} is activated."
+            msg = f"The project with name '{proj.project_name}' at {proj.project_root} is activated.\n"
         if self._language_backend == LanguageBackend.LSP:
-            languages_str = ", ".join([lang.value for lang in proj.project_config.languages])
-            msg += f"\nProgramming languages: {languages_str}."
-        msg += f"File encoding: {proj.project_config.encoding}."
+            language_servers_str = ", ".join([ls.value for ls in proj.project_config.language_servers])
+            msg += f"Active language servers: {language_servers_str}.\n"
+        msg += f"File encoding: {proj.project_config.encoding}.\n"
 
         # add list of memories (if memories are enabled)
         include_memories = self._active_tools.contains_tool_class(ReadMemoryTool)
         if include_memories:
-            project_memories = proj.memories_manager.list_project_memories()
+            project_memories = proj.memory_manager.list_project_memories()
             if project_memories:
                 msg += (
-                    f"\n{json.dumps(project_memories.to_dict())}\n"
-                    + "Use the `read_memory` tool to read these memories later if they are relevant to the task."
+                    f"{json.dumps(project_memories.to_dict())}\n"
+                    + f"Use the `{ReadMemoryTool.get_name_from_cls()}` tool to read these memories later if they are relevant to the task.\n"
                 )
+            elif self._active_tools.contains_tool_class(OnboardingTool):
+                msg += f"Onboarding has not been performed yet. Ask the user whether to perform onboarding via the `{OnboardingTool.get_name_from_cls()}` tool.\n"
 
         # add prompts for modes that were dynamically activated by the project
         modes_with_prompts = self._project_prompt_status.get_modes_with_prompts_to_be_provided_for_project_activation(session_id)
         if modes_with_prompts:
-            msg += "\nNewly applicable mode instructions:"
             for mode in modes_with_prompts:
-                msg += f"\n{mode.prompt}"
+                msg += self._render_prompt(mode.prompt, tag="mode", tag_name_attr=mode.name) + "\n"
         self._project_prompt_status.mark_mode_prompts_as_provided(session_id)
 
         # add project-specific prompt
         if proj.project_config.initial_prompt:
-            msg += f"\nProject-specific instructions:\n {proj.project_config.initial_prompt}"
+            msg += "\n" + self._render_prompt(proj.project_config.initial_prompt, tag="project-instructions")
 
         self._project_prompt_status.mark_project_activation_message_as_provided(session_id)
 
@@ -1003,7 +1117,10 @@ class SerenaAgent:
         Updates the active modes based on the Serena configuration, the active project configuration (if any),
         and mode overrides (if any).
         """
-        self._active_modes = ActiveModes()
+        background_base_modes = []
+        if self._language_backend.is_jetbrains():
+            background_base_modes.append(SerenaAgentMode.from_name_internal("jetbrains"))
+        self._active_modes = ActiveModes(background_base_modes=background_base_modes)
         self._active_modes.apply(self.serena_config)
         if self._active_project:
             self._active_modes.apply(self._active_project.project_config)
@@ -1068,6 +1185,27 @@ class SerenaAgent:
         """
         return self._task_executor.execute_task(task, name=name, logged=logged, timeout=timeout)
 
+    def _task_completion_callback(self) -> None:
+        """
+        Called after every task completion. Tasks potentially change the agent's state/configuration.
+        """
+        self._on_config_changed()
+
+    def _on_config_changed(self) -> None:
+        for callback in self._config_changed_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                log.error(f"Error in config changed callback {callback}: {e}", exc_info=e)
+
+    def register_config_changed_callback(self, callback: Callable[[], None]) -> None:
+        """
+        Registers a callback to be called when the agent configuration has (potentially) changed.
+
+        :param callback: the callback function to register
+        """
+        self._config_changed_callbacks.append(callback)
+
     def is_using_language_server(self) -> bool:
         """
         :return: whether this agent uses language server-based code analysis
@@ -1083,6 +1221,8 @@ class SerenaAgent:
             return False
 
         log.info(f"Activating {project.project_name} at {project.project_root}")
+
+        self._project_activation_error = None
 
         # check if the project requires a different language backend than the one initialized at startup
         project_backend = project.project_config.language_backend
@@ -1114,14 +1254,12 @@ class SerenaAgent:
         if update_active_tools:
             self._update_active_tools()
 
-        def init_language_server_manager() -> None:
-            # start the language server
-            with LogTime("Language server initialization", logger=log):
-                self.reset_language_server_manager()
+        def init_project_services() -> None:
+            self._run_project_activation_command(project)
+            self._init_active_project_language_backend()
 
-        # initialize the language server in the background (if in language server mode)
-        if self.get_language_backend().is_lsp():
-            self.issue_task(init_language_server_manager)
+        # initialise the project's language backend in the background
+        self.issue_task(init_project_services)
 
         if self._project_activation_callback is not None:
             self._project_activation_callback()
@@ -1131,6 +1269,70 @@ class SerenaAgent:
             self._dashboard_manager.update_active_project(self._active_project)
 
         return True
+
+    @staticmethod
+    def _run_project_activation_command(project: Project) -> None:
+        """
+        Runs the given project's activation_command (if set and the project is trusted).
+        Failures are logged.
+        """
+        activation_command = project.project_config.activation_command
+        if not activation_command:
+            return
+        if not project.is_trusted():
+            log.warning(
+                f"Project path {project.project_root} is not trusted, ignoring activation_command "
+                "from project configuration. To trust the project, modify the trusted path patterns "
+                "in the global configuration."
+            )
+            return
+        timeout = project.project_config.activation_command_timeout
+        cmd = subprocess_util.convert_shell_cmd(activation_command)
+        log.info(f"Running activation_command for project '{project.project_name}': {cmd}")
+        try:
+            with LogTime("Project activation command", logger=log):
+                p = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    cwd=project.project_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **subprocess_util.subprocess_kwargs(),
+                )
+                try:
+                    _, stderr = p.communicate(timeout=timeout)
+                    if p.returncode != 0:
+                        log.error(f"activation_command for project '{project.project_name}' failed (exit {p.returncode}): {stderr.strip()}")
+                except subprocess.TimeoutExpired:
+                    log.error(
+                        f"Activation_command for project '{project.project_name}' timed out after "
+                        f"{timeout}s; terminating process and continuing with backend initialisation."
+                    )
+                    terminate_process_tree_with_kill_fallback(p, terminate_timeout=5.0, process_name="activation_command")
+        except Exception:
+            log.exception(f"Unexpected error running activation_command for project '{project.project_name}'")
+
+    def _init_active_project_language_backend(self) -> None:
+        """
+        Initialises the active project's language backend
+        """
+        project = self._active_project
+        assert project is not None
+
+        # for LSP mode, start the language server manager
+        if self.get_language_backend().is_lsp():
+            with LogTime("Language server initialization", logger=log):
+                self.reset_language_server_manager()
+
+        # for JetBrains mode, search for plugin server and spawn IDE (if not found and launch command provided)
+        elif self.get_language_backend().is_jetbrains():
+            client = jetbrains_launch_coordinator.find_plugin_server(project)
+            if client is not None:
+                log.info("Found Serena JetBrains Plugin server: %s", client)
+            else:
+                log.info("Serena JetBrains Plugin server not found for project %s", project.project_name)
+                if self.serena_config.jetbrains_launch_command:
+                    jetbrains_launch_coordinator.launch_and_wait_for_plugin_server(project, self.serena_config.jetbrains_launch_command)
 
     def activate_project_from_path_or_name(
         self, project_root_or_name: str, update_active_modes: bool = True, update_active_tools: bool = True
@@ -1147,7 +1349,7 @@ class SerenaAgent:
         if project_instance is not None:
             log.info(f"Found registered project '{project_instance.project_name}' at path {project_instance.project_root}")
         elif os.path.isdir(project_root_or_name):
-            project_instance = self.serena_config.add_project_from_path(project_root_or_name)
+            project_instance = self.serena_config.add_project_from_path(project_root_or_name, asynchronous_autogen=True)
             log.info(f"Added new project {project_instance.project_name} for path {project_instance.project_root}")
 
         if project_instance is None:
@@ -1193,11 +1395,13 @@ class SerenaAgent:
         if self._active_project and self._active_project.project_config.language_backend is not None:
             result_str += " (project override)"
         result_str += f" (global default: {self.serena_config.language_backend.value})\n"
+        if self._language_backend.is_lsp() and self._active_project:
+            result_str += f"Language server status: {self._active_project.get_language_server_manager_status()}\n"
         result_str += "Available projects:\n" + "\n".join(list(self.serena_config.project_names)) + "\n"
         result_str += f"Active context: {self._context.name}\n"
 
         # Active modes
-        active_mode_names = [mode.name for mode in self.get_active_modes()]
+        active_mode_names = self.get_active_modes().get_mode_names()
         result_str += "Active modes: {}\n".format(", ".join(active_mode_names)) + "\n"
 
         # Available but not active modes
@@ -1232,43 +1436,42 @@ class SerenaAgent:
         """
         self.get_active_project_or_raise().create_language_server_manager()
 
-    def add_language(self, language: Language) -> None:
+    def add_language_server(self, ls_id: LanguageServerId) -> None:
         """
-        Adds a new language to the active project, spawning the respective language server and updating the project configuration.
+        Adds a new language server to the active project, spawning the respective language server and updating the project configuration.
         The addition is scheduled via the agent's task executor and executed synchronously, i.e. the method returns
         when the addition is complete.
 
-        :param language: the language to add
+        :param ls_id: the language server to add
         """
-        self.execute_task(lambda: self.get_active_project_or_raise().add_language(language), name=f"AddLanguage:{language.value}")
+        self.execute_task(lambda: self.get_active_project_or_raise().add_language_server(ls_id), name=f"AddLanguage:{ls_id.value}")
 
-    def remove_language(self, language: Language) -> None:
+    def remove_language_server(self, ls_id: LanguageServerId) -> None:
         """
-        Removes a language from the active project, shutting down the respective language server and updating the project configuration.
+        Removes a language server from the active project, shutting down the respective server and updating the project configuration.
         The removal is scheduled via the agent's task executor and executed asynchronously.
 
-        :param language: the language to remove
+        :param ls_id: the language to remove
         """
-        self.issue_task(lambda: self.get_active_project_or_raise().remove_language(language), name=f"RemoveLanguage:{language.value}")
+        self.issue_task(lambda: self.get_active_project_or_raise().remove_language_server(ls_id), name=f"RemoveLanguage:{ls_id.value}")
 
     def get_tool(self, tool_class: type[TTool]) -> TTool:
-        return self._all_tools[tool_class]  # type: ignore
+        return self._all_tools[tool_class]
 
     def print_tool_overview(self) -> None:
         ToolRegistry().print_tool_overview(self._active_tools.tools)
 
     def __del__(self) -> None:
-        self.on_shutdown()
+        is_object_initialised = "_active_project" in self.__dict__
+        if is_object_initialised:
+            self.on_shutdown()
 
     def on_shutdown(self, timeout: float = 2.0) -> None:
         """
         Shutdown handler of the agent, freeing resources and stopping background tasks.
         """
         log.info("SerenaAgent is shutting down ...")
-        if self._active_project is not None:
-            log.info(f"Shutting down active project '{self._active_project.project_name}' ...")
-            self._active_project.shutdown(timeout=timeout)
-            self._active_project = None
+        # apply shutdown depending on allocated resources, handling quick ones first (dashboard manager & GUI viewer)
         if self._gui_log_viewer:
             log.info("Stopping the GUI log window ...")
             self._gui_log_viewer.stop()
@@ -1276,6 +1479,10 @@ class SerenaAgent:
         if self._dashboard_manager:
             self._dashboard_manager.shutdown()
             self._dashboard_manager = None
+        if self._active_project is not None:
+            log.info(f"Shutting down active project '{self._active_project.project_name}' ...")
+            self._active_project.shutdown(timeout=timeout)
+            self._active_project = None
 
     def shutdown(self) -> None:
         """
@@ -1291,11 +1498,11 @@ class SerenaAgent:
         tool_class = ToolRegistry().get_tool_class_by_name(tool_name)
         return self.get_tool(tool_class)
 
-    def get_active_lsp_languages(self) -> list[Language]:
+    def get_active_language_server_ids(self) -> list[LanguageServerId]:
         ls_manager = self.get_language_server_manager()
         if ls_manager is None:
             return []
-        return ls_manager.get_active_languages()
+        return ls_manager.get_active_language_server_ids()
 
     @contextmanager
     def active_project_context(self, project: Project) -> Iterator[None]:

@@ -2,19 +2,18 @@ import logging
 import os
 import pathlib
 import stat
-import subprocess
 import threading
 from collections.abc import Hashable
-from typing import Any, cast
+from typing import Any
 
 from overrides import override
 
 from solidlsp.ls import RawDocumentSymbol, SolidLanguageServer
-from solidlsp.ls_config import Language, LanguageServerConfig
+from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.util.subprocess_util import subprocess_run
 
 from ..common import RuntimeDependency
 
@@ -65,7 +64,7 @@ class ElixirTools(SolidLanguageServer):
     def _get_elixir_version(cls) -> str | None:
         """Get the installed Elixir version or None if not found."""
         try:
-            result = subprocess.run(["elixir", "--version"], capture_output=True, text=True, check=False)
+            result = subprocess_run(["elixir", "--version"], capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 return result.stdout.strip()
         except FileNotFoundError:
@@ -78,7 +77,7 @@ class ElixirTools(SolidLanguageServer):
         Setup runtime dependencies for Expert.
         Downloads the Expert binary for the current platform and returns the path to the executable.
         """
-        elixir_settings = solidlsp_settings.get_ls_specific_settings(Language.ELIXIR)
+        elixir_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.ELIXIR)
         expert_version = elixir_settings.get("expert_version", EXPERT_VERSION)
         # Check if Elixir is available first
         elixir_version = cls._get_elixir_version()
@@ -98,16 +97,6 @@ class ElixirTools(SolidLanguageServer):
             return expert_in_path
 
         platform_id = PlatformUtils.get_platform_id()
-
-        valid_platforms = [
-            PlatformId.LINUX_x64,
-            PlatformId.LINUX_arm64,
-            PlatformId.OSX_x64,
-            PlatformId.OSX_arm64,
-            PlatformId.WIN_x64,
-        ]
-        assert platform_id in valid_platforms, f"Platform {platform_id} is not supported for Expert at the moment"
-
         expert_dir = os.path.join(cls.ls_resources_dir(solidlsp_settings), "expert")
 
         # Define runtime dependencies inline
@@ -164,6 +153,8 @@ class ElixirTools(SolidLanguageServer):
             ),
         }
 
+        if platform_id not in runtime_deps:
+            raise RuntimeError(f"Platform {platform_id} is not supported for Expert")
         dependency = runtime_deps[platform_id]
         # On Windows, use .exe extension
         executable_name = "expert.exe" if platform_id.value.startswith("win") else "expert"
@@ -212,6 +203,7 @@ class ElixirTools(SolidLanguageServer):
         )
         self.server_ready = threading.Event()
         self.request_id = 0
+        self._building_project = False
 
         # Set generous timeout for Expert which can be slow to initialize and respond
         self.set_request_timeout(180.0)
@@ -255,19 +247,12 @@ class ElixirTools(SolidLanguageServer):
 
         return None
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the Expert Language Server.
         """
-        # Ensure the path is absolute
-        abs_path = os.path.abspath(repository_absolute_path)
-        root_uri = pathlib.Path(abs_path).as_uri()
         initialize_params = {
-            "processId": os.getpid(),
             "locale": "en",
-            "rootPath": abs_path,
-            "rootUri": root_uri,
             "initializationOptions": {
                 "mix_env": "dev",
                 "mix_target": "host",
@@ -318,10 +303,9 @@ class ElixirTools(SolidLanguageServer):
                     "workDoneProgress": True,
                 },
             },
-            "workspaceFolders": [{"uri": root_uri, "name": os.path.basename(repository_absolute_path)}],
         }
 
-        return cast(InitializeParams, initialize_params)
+        return initialize_params
 
     def _start_server(self) -> None:
         """Start Expert server process"""
@@ -380,7 +364,7 @@ class ElixirTools(SolidLanguageServer):
 
         log.debug("Starting Expert server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.debug("Sending initialize request to Expert")
         init_response = self.server.send.initialize(initialize_params)

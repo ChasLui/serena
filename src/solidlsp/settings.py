@@ -11,13 +11,22 @@ from typing import TYPE_CHECKING, Any
 from sensai.util.string import ToStringMixin
 
 if TYPE_CHECKING:
-    from solidlsp.ls_config import Language
+    from solidlsp.ls_config import LanguageServerId
 
 log = logging.getLogger(__name__)
 
 
+SOLIDLSP_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+
+
 @dataclass
 class SolidLSPSettings:
+    """
+    Configures SolidLSP-specific data storage as well as global settings.
+
+    Note: Server instance-specific settings belong in LanguageServerConfig, not here.
+    """
+
     solidlsp_dir: str = str(pathlib.Path.home() / ".solidlsp")
     """
     Path to the directory in which to store global Solid-LSP data (which is not project-specific)
@@ -28,18 +37,11 @@ class SolidLSPSettings:
     For instance, if this is "/home/user/myproject/.solidlsp",
     then Solid-LSP will store project-specific data (e.g. caches) in that directory.
     """
-    ls_specific_settings: dict["Language", dict[str, Any]] = field(default_factory=dict)
+    ls_specific_settings: dict["LanguageServerId", dict[str, Any]] = field(default_factory=dict)
     """
     Advanced configuration option allowing to configure language server implementation specific options.
     Have a look at the docstring of the constructors of the corresponding LS implementations within solidlsp to see which options are available.
     No documentation on options means no options are available.
-    """
-    additional_workspace_folders: list[str] = field(default_factory=list)
-    """
-    Additional workspace folder paths for cross-package reference support.
-    Paths can be absolute or relative to the project root. Each folder is added as a workspace
-    folder in the LSP initialization, enabling language servers to discover symbols and references
-    across package boundaries (e.g. in monorepos).
     """
 
     def __post_init__(self) -> None:
@@ -51,6 +53,10 @@ class SolidLSPSettings:
         return os.path.join(str(self.solidlsp_dir), "language_servers", "static")
 
     class CustomLSSettings(ToStringMixin):
+        """
+        Represents custom (user-specified) settings for a specific language server.
+        """
+
         def __init__(self, settings: dict[str, Any] | None) -> None:
             self.settings = settings or {}
 
@@ -70,11 +76,11 @@ class SolidLSPSettings:
                 value = default_value
             return value
 
-    def get_ls_specific_settings(self, language: "Language") -> CustomLSSettings:
+    def get_ls_specific_settings(self, ls_id: "LanguageServerId") -> CustomLSSettings:
         """
-        Get the language server specific settings for the given language.
+        Gets the custom settings for the given language server
 
-        :param language: The programming language.
-        :return: A dictionary of settings for the language server.
+        :param ls_id: the language server identifier for which to retrieve settings
+        :return: a dictionary of settings for the language server
         """
-        return self.CustomLSSettings(self.ls_specific_settings.get(language))
+        return self.CustomLSSettings(self.ls_specific_settings.get(ls_id))

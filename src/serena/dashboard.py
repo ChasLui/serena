@@ -26,7 +26,9 @@ from serena.config.serena_config import SerenaConfig, SerenaPaths
 from serena.constants import SERENA_DASHBOARD_DIR, SerenaPorts
 from serena.task_executor import TaskExecutor
 from serena.util.logging import MemoryLogHandler
+from serena.util.pypi import PyPIPackageInfo
 from serena.util.pywebview import WebViewWithTray
+from serena.util.version import Version
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -71,6 +73,7 @@ class ResponseConfigOverview(BaseModel):
     encoding: str | None
     current_client: str | None
     serena_version: str
+    newer_serena_version: str | None
 
 
 class ResponseAvailableLanguages(BaseModel):
@@ -197,22 +200,53 @@ class SerenaDashboardAPI:
         tool_names: list[str],
         agent: "SerenaAgent",
         tool_usage_stats: ToolUsageStats | None = None,
+        host: str = "127.0.0.1",
+        trusted_hosts: list[str] | None = None,
     ) -> None:
         self._memory_log_handler = memory_log_handler
         self._tool_names = tool_names
         self._agent = agent
-        self._app = Flask(__name__)
+        self._host = host
+        self._app = Flask(self.__class__.__name__)
+        if trusted_hosts:
+            self._app.config["TRUSTED_HOSTS"] = trusted_hosts
         self._tool_usage_stats = tool_usage_stats
         self._loaded_news: dict[str, str] = {}
         self._news_ready = threading.Event()
         self._setup_routes()
         self._read_news = ReadNews.load()
-        # Fetch remote news in background on startup (non-blocking)
+        self._newer_serena_version: str | None = None
+
+        # register callback for config changes
+        self._current_config_overview: dict[str, Any] | None = None
+        self._agent.register_config_changed_callback(self._on_agent_config_changed)
+
+        # start threads for background computations
+        # * fetch remote news in background on startup (non-blocking)
         threading.Thread(target=self._fetch_news, daemon=True).start()
+        # * determine if a newer Serena version is available
+        threading.Thread(target=self._determine_newer_serena_version, daemon=True).start()
 
     @property
     def memory_log_handler(self) -> MemoryLogHandler:
         return self._memory_log_handler
+
+    def _determine_newer_serena_version(self) -> str | None:
+        """
+        Checks for availability of a newer Serena version on PyPI and stores it in self._newer_serena_version if found.
+        """
+        try:
+            # query PyPI for the latest released version
+            latest_serena_version = PyPIPackageInfo("serena-agent").get_latest_version(timeout_secs=5)
+
+            # compare against the running version
+            latest_version = Version(latest_serena_version)
+            current_version = Version(self._agent.version)
+            log.debug("Latest available Serena version on PyPI: %s, current version: %s", latest_version, current_version)
+            if not current_version.is_at_least(*latest_version.components):
+                self._newer_serena_version = latest_serena_version
+        except Exception as e:
+            log.info("Failed to check for newer Serena version on PyPI: %s", e)
 
     def _setup_routes(self) -> None:
         @self._app.route("/")
@@ -272,8 +306,10 @@ class SerenaDashboardAPI:
 
         @self._app.route("/get_config_overview", methods=["GET"])
         def get_config_overview() -> dict[str, Any]:
-            result = self._agent.execute_task(self._get_config_overview, logged=False)
-            return result.model_dump()
+            result = self._current_config_overview
+            if result is None:
+                raise ValueError("Config overview not yet available")
+            return result
 
         @self._app.route("/shutdown", methods=["PUT"])
         def shutdown() -> dict[str, str]:
@@ -468,7 +504,7 @@ class SerenaDashboardAPI:
         if self._tool_usage_stats is not None:
             self._tool_usage_stats.clear()
 
-    def _get_config_overview(self) -> ResponseConfigOverview:
+    def _compute_config_overview(self) -> ResponseConfigOverview:
         from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
         from serena.tools.tools_base import Tool
 
@@ -477,7 +513,7 @@ class SerenaDashboardAPI:
         active_project_name = project.project_name if project else None
         project_info = {
             "name": active_project_name,
-            "language": ", ".join([l.value for l in project.project_config.languages]) if project else None,
+            "language": ", ".join([l.value for l in project.project_config.language_servers]) if project else None,
             "path": str(project.project_root) if project else None,
         }
 
@@ -490,7 +526,7 @@ class SerenaDashboardAPI:
         }
 
         # Get active modes
-        modes = self._agent.get_active_modes()
+        modes = self._agent.get_active_modes().get_modes(include_background_base_modes=False)
         modes_info = [
             {"name": mode.name, "description": mode.description, "path": SerenaAgentMode.get_path(mode.name, instance=mode)}
             for mode in modes
@@ -566,12 +602,12 @@ class SerenaDashboardAPI:
         # Get available memories if ReadMemoryTool is active
         available_memories = None
         if self._agent.tool_is_active("read_memory") and project is not None:
-            available_memories = project.memories_manager.list_memories().get_full_list()
+            available_memories = project.memory_manager.list_memories().get_full_list()
 
         # Get list of languages for the active project
         languages = []
         if project is not None:
-            languages = [lang.value for lang in project.project_config.languages]
+            languages = [lang.value for lang in project.project_config.language_servers]
 
         # Get file encoding for the active project
         encoding = None
@@ -594,18 +630,22 @@ class SerenaDashboardAPI:
             encoding=encoding,
             current_client=Tool.get_last_tool_call_client_str(),
             serena_version=self._agent.version,
+            newer_serena_version=self._newer_serena_version,
         )
 
+    def _on_agent_config_changed(self) -> None:
+        self._current_config_overview = self._compute_config_overview().model_dump()
+
     def _get_available_languages(self) -> ResponseAvailableLanguages:
-        from solidlsp.ls_config import Language
+        from solidlsp.ls_config import LanguageServerId
 
         def run() -> ResponseAvailableLanguages:
-            all_languages = [lang.value for lang in Language.iter_all(include_experimental=True)]
+            all_languages = [lang.value for lang in LanguageServerId.iter_all(include_experimental=True)]
 
             # Filter out already added languages for the active project
             project = self._agent.get_active_project()
             if project:
-                current_languages = [lang.value for lang in project.project_config.languages]
+                current_languages = [lang.value for lang in project.project_config.language_servers]
                 available_languages = [lang for lang in all_languages if lang not in current_languages]
             else:
                 available_languages = all_languages
@@ -620,7 +660,7 @@ class SerenaDashboardAPI:
             if project is None:
                 raise ValueError("No active project")
 
-            content = project.memories_manager.load_memory(request_get_memory.memory_name)
+            content = project.memory_manager.load_memory(request_get_memory.memory_name)
             return ResponseGetMemory(content=content, memory_name=request_get_memory.memory_name)
 
         return self._agent.execute_task(run, logged=False)
@@ -630,7 +670,7 @@ class SerenaDashboardAPI:
             project = self._agent.get_active_project()
             if project is None:
                 raise ValueError("No active project")
-            project.memories_manager.save_memory(request_save_memory.memory_name, request_save_memory.content, is_tool_context=False)
+            project.memory_manager.save_memory(request_save_memory.memory_name, request_save_memory.content, is_tool_context=False)
 
         self._agent.execute_task(run, logged=True, name="SaveMemory")
 
@@ -639,7 +679,7 @@ class SerenaDashboardAPI:
             project = self._agent.get_active_project()
             if project is None:
                 raise ValueError("No active project")
-            project.memories_manager.delete_memory(request_delete_memory.memory_name, is_tool_context=False)
+            project.memory_manager.delete_memory(request_delete_memory.memory_name, is_tool_context=False)
 
         self._agent.execute_task(run, logged=True, name="DeleteMemory")
 
@@ -649,9 +689,7 @@ class SerenaDashboardAPI:
             if project is None:
                 raise ValueError("No active project")
 
-            return project.memories_manager.move_memory(
-                request_rename_memory.old_name, request_rename_memory.new_name, is_tool_context=False
-            )
+            return project.memory_manager.move_memory(request_rename_memory.old_name, request_rename_memory.new_name, is_tool_context=False)
 
         return self._agent.execute_task(run, logged=True, name="RenameMemory")
 
@@ -737,24 +775,24 @@ class SerenaDashboardAPI:
         return {}
 
     def _add_language(self, request_add_language: RequestAddLanguage) -> None:
-        from solidlsp.ls_config import Language
+        from solidlsp.ls_config import LanguageServerId
 
         try:
-            language = Language(request_add_language.language)
+            language = LanguageServerId(request_add_language.language)
         except ValueError:
-            raise ValueError(f"Invalid language: {request_add_language.language}")
+            raise ValueError(f"Invalid language server identifier: {request_add_language.language}")
         # add_language is already thread-safe
-        self._agent.add_language(language)
+        self._agent.add_language_server(language)
 
     def _remove_language(self, request_remove_language: RequestRemoveLanguage) -> None:
-        from solidlsp.ls_config import Language
+        from solidlsp.ls_config import LanguageServerId
 
         try:
-            language = Language(request_remove_language.language)
+            language = LanguageServerId(request_remove_language.language)
         except ValueError:
-            raise ValueError(f"Invalid language: {request_remove_language.language}")
+            raise ValueError(f"Invalid language server identifier: {request_remove_language.language}")
         # remove_language is already thread-safe
-        self._agent.remove_language(language)
+        self._agent.remove_language_server(language)
 
     @staticmethod
     def _find_first_free_port(start_port: int, host: str) -> int:
@@ -769,22 +807,23 @@ class SerenaDashboardAPI:
 
         raise RuntimeError(f"No free ports found starting from {start_port}")
 
-    def run(self, host: str, port: int) -> int:
+    def run(self, port: int) -> int:
         """
         Runs the dashboard on the given host and port and returns the port number.
         """
         # patch flask.cli.show_server to avoid printing the server info
         from flask import cli
 
-        cli.show_server_banner = lambda *args, **kwargs: None
-
-        self._app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+        # ty cannot model reassigning a third-party module's function attribute (it rejects any
+        # replacement, even one with an identical signature), so the monkeypatch is suppressed here
+        cli.show_server_banner = lambda *args, **kwargs: None  # ty: ignore[invalid-assignment]
+        self._app.run(host=self._host, port=port, debug=False, use_reloader=False, threaded=True)
         return port
 
-    def run_in_thread(self, host: str) -> tuple[threading.Thread, int]:
-        port = self._find_first_free_port(self.BASE_PORT, host)
-        log.info("Starting dashboard (listen_address=%s, port=%d)", host, port)
-        thread = threading.Thread(target=lambda: self.run(host=host, port=port), daemon=True)
+    def run_in_thread(self) -> tuple[threading.Thread, int]:
+        port = self._find_first_free_port(self.BASE_PORT, self._host)
+        log.info("Starting dashboard (listen_address=%s, port=%d)", self._host, port)
+        thread = threading.Thread(target=lambda: self.run(port=port), daemon=True)
         thread.start()
         return thread, port
 
@@ -801,13 +840,14 @@ def open_url_in_browser(url: str, use_subprocess: bool = False) -> None:
     if use_subprocess:
         # Use a subprocess to avoid any output from webbrowser.open being written to stdout
         try:
-            subprocess.Popen(
+            p = subprocess.Popen(
                 [sys.executable, "-c", f"import webbrowser; webbrowser.open({url!r})"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=False,
             )
+            threading.Thread(target=p.wait, daemon=True).start()
         except Exception as e:
             # Subprocess creation can fail in rare cases (e.g. on some Linux systems; possibly subprocess/glibc bug)
             # See #1363
@@ -926,6 +966,8 @@ class SerenaDashboardTrayManager:
     HOST = "127.0.0.1"
     """listen address (local only)"""
 
+    TRUSTED_HOSTS = ["localhost", "127.0.0.1"]
+
     ALIVE_CHECK_INTERVAL_SECONDS = 3
     """interval in seconds between alive checks of registered instances"""
 
@@ -944,7 +986,8 @@ class SerenaDashboardTrayManager:
         self._lock = threading.Lock()
         self._tray_icon: Optional["pystray.Icon"] = None
         self._alive_check_use_pid = alive_check_use_pid
-        self._app = Flask(__name__)
+        self._app = Flask(self.__class__.__name__)
+        self._app.config["TRUSTED_HOSTS"] = self.TRUSTED_HOSTS
         self._setup_routes()
         self._use_pywebview = use_pywebview
 
@@ -1112,6 +1155,7 @@ class SerenaDashboardTrayManager:
                         for port in dead_ports:
                             self._instances.pop(port, None)
                             log.info("Removed unreachable instance on port %d", port)
+                    self._update_menu()
 
                 # terminate if no instances remain
                 with self._lock:
@@ -1155,9 +1199,12 @@ class SerenaDashboardTrayManager:
         # set up tray icon with a dynamic menu (callable returns items on each open)
         kwargs: dict[str, Any] = {}
         if sys.platform == "darwin":
-            from AppKit import NSApplication
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
-            kwargs["darwin_nsapplication"] = NSApplication.sharedApplication()
+            nsapp = NSApplication.sharedApplication()
+            # run as an accessory app so that only the menu bar icon is shown (no Dock icon)
+            nsapp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            kwargs["darwin_nsapplication"] = nsapp
 
         self._tray_icon = pystray.Icon(
             "serena_tray_manager",

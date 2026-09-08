@@ -7,7 +7,6 @@ You can pass the following entries in ``ls_specific_settings["al"]``:
 
 import logging
 import os
-import pathlib
 import platform
 import re
 import stat
@@ -19,7 +18,7 @@ from overrides import override
 from solidlsp import ls_types
 from solidlsp.language_servers.common import quote_windows_path
 from solidlsp.ls import DocumentSymbols, LSPFileBuffer, RawDocumentSymbol, SolidLanguageServer
-from solidlsp.ls_config import Language, LanguageServerConfig
+from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_types import SymbolKind, UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils
 from solidlsp.lsp_protocol_handler.lsp_types import Definition, DefinitionParams, LocationLink
@@ -241,7 +240,7 @@ class ALLanguageServer(SolidLanguageServer):
             log.warning(f"AL_EXTENSION_PATH set but directory not found: {env_path}")
 
         # Check the resolved-version download location (versioned for non-INITIAL, legacy "al-extension" for INITIAL)
-        al_settings = solidlsp_settings.get_ls_specific_settings(Language.AL)
+        al_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.AL)
         al_extension_version = al_settings.get("al_extension_version", DEFAULT_AL_EXTENSION_VERSION)
         default_path = os.path.join(cls.ls_resources_dir(solidlsp_settings), _al_extension_dirname(al_extension_version), "extension")
         if os.path.exists(default_path):
@@ -266,7 +265,7 @@ class ALLanguageServer(SolidLanguageServer):
             Path to installed extension or None if download failed
 
         """
-        al_settings = solidlsp_settings.get_ls_specific_settings(Language.AL)
+        al_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.AL)
         al_extension_version = al_settings.get("al_extension_version", DEFAULT_AL_EXTENSION_VERSION)
         al_extension_dir = os.path.join(cls.ls_resources_dir(solidlsp_settings), _al_extension_dirname(al_extension_version))
         al_extension_url = (
@@ -448,20 +447,12 @@ class ALLanguageServer(SolidLanguageServer):
 
         return None
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> dict:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the AL Language Server.
         """
-        # Ensure we have an absolute path for URI generation
-        repository_path = pathlib.Path(repository_absolute_path).resolve()
-        root_uri = repository_path.as_uri()
-
         # AL requires extensive capabilities based on VS Code trace
         initialize_params = {
-            "processId": os.getpid(),
-            "rootPath": str(repository_path),
-            "rootUri": root_uri,
             "capabilities": {
                 "workspace": {
                     "applyEdit": True,
@@ -512,7 +503,6 @@ class ALLanguageServer(SolidLanguageServer):
                 },
             },
             "trace": "verbose",
-            "workspaceFolders": [{"uri": root_uri, "name": repository_path.name}],
         }
 
         return initialize_params
@@ -556,12 +546,12 @@ class ALLanguageServer(SolidLanguageServer):
         self.server.start()
 
         # Send initialize request
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to AL LSP server and awaiting response")
 
         # Send initialize and wait for response
-        resp = self.server.send_request("initialize", initialize_params)
+        resp = self.server.send_request("initialize", dict(initialize_params))
         if resp is None:
             raise RuntimeError("AL Language Server initialization failed - no response")
 
@@ -1002,25 +992,19 @@ class ALLanguageServer(SolidLanguageServer):
 
     @override
     def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
-        """
-        Override to normalize AL symbol names by stripping object type and ID metadata.
-
-        AL Language Server returns symbol names with full object format like
-        'Table 50000 "TEST Customer"', but symbol names should be pure without metadata.
-        This follows the same pattern as Java LS which strips type information from names.
-
-        Metadata (object type, ID) is available via the hover LSP method when using
-        include_info=True in find_symbol.
-        """
-        # Normalize path separators for cross-platform compatibility (backslash → forward slash)
         relative_file_path = self._normalize_path(relative_file_path)
-
-        # Get symbols from parent implementation
-        document_symbols = super().request_document_symbols(relative_file_path, file_buffer=file_buffer)
-
-        return document_symbols
+        return super().request_document_symbols(relative_file_path, file_buffer=file_buffer)
 
     def _normalize_symbol_name(self, symbol: RawDocumentSymbol, relative_file_path: str) -> str:
+        # Override to normalize AL symbol names by stripping object type and ID metadata.
+        # IMPORTANT: Update _document_symbols_cache_fingerprint if this normalization logic changes.
+        #
+        # AL Language Server returns symbol names with full object format like
+        # 'Table 50000 "TEST Customer"', but symbol names should be pure without metadata.
+        # This follows the same pattern as Java LS which strips type information from names.
+        #
+        # Metadata (object type, ID) is available via the hover LSP method when using
+        # include_info=True in find_symbol.
         original_name = symbol["name"]
         normalized_name = self._extract_al_display_name(original_name)
 
@@ -1038,7 +1022,7 @@ class ALLanguageServer(SolidLanguageServer):
         if original_name != normalized_name and self._AL_OBJECT_NAME_PATTERN.match(original_name):
             sel_range = symbol.get("selectionRange")
             if sel_range:
-                start = sel_range.get("start")  # type: ignore
+                start = sel_range.get("start")
                 if start and "line" in start and "character" in start:
                     line = start["line"]
                     char = start["character"]

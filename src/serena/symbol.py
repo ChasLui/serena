@@ -5,6 +5,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any, Generic, Literal, NotRequired, Self, TypedDict, TypeVar
@@ -246,7 +247,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         :return: whether the symbol is a low-level symbol (variable, constant, etc.), which typically represents data
             rather than structure and therefore is not relevant in a high-level overview of the code.
         """
-        return self.symbol_kind >= SymbolKind.Variable.value
+        return not SymbolKind.is_container(self.symbol_kind)
 
     @property
     def overload_idx(self) -> int | None:
@@ -1261,6 +1262,7 @@ class SymbolDictGrouper(Generic[TSymbolDict], ABC):
         self._group_keys = group_keys
         self._group_children_keys = group_children_keys
         self._collapse_singleton = collapse_singleton
+        self._is_enabled = True
 
     def _group_by(self, l: list[dict], keys: list[str], children_keys: list[str], is_children: bool) -> dict[str, Any] | list[Any]:
         """
@@ -1321,7 +1323,23 @@ class SymbolDictGrouper(Generic[TSymbolDict], ABC):
         """
         # avoid side effects by working on a deep-copy
         symbols_copy = copy.deepcopy(symbols)
-        return self._group_by(symbols_copy, self._group_keys, self._group_children_keys, is_children=False)  # type: ignore
+
+        if not self._is_enabled:
+            return symbols_copy
+
+        return self._group_by(symbols_copy, self._group_keys, self._group_children_keys, is_children=False)
+
+    @contextmanager
+    def disabled_context(self) -> Iterator[None]:
+        """
+        A context manager that temporarily disables grouping.
+        """
+        original_state = self._is_enabled
+        self._is_enabled = False
+        try:
+            yield
+        finally:
+            self._is_enabled = original_state
 
 
 class LanguageServerSymbolDictGrouper(SymbolDictGrouper[LanguageServerSymbol.OutputDict]):

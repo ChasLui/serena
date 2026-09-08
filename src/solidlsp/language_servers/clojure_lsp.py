@@ -9,14 +9,13 @@ import re
 import shutil
 import subprocess
 import threading
-from typing import cast
 
 from overrides import override
 
 from solidlsp.ls import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.util.subprocess_util import subprocess_run
 
 from .common import RuntimeDependency, RuntimeDependencyCollection
 
@@ -59,8 +58,13 @@ CLOJURE_LSP_ALLOWED_HOSTS = (
 
 
 def run_command(cmd: list, capture_output: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, stdout=subprocess.PIPE if capture_output else None, stderr=subprocess.STDOUT if capture_output else None, text=True, check=True
+    return subprocess_run(
+        cmd,
+        capture_output=False,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.STDOUT if capture_output else None,
+        text=True,
+        check=True,
     )
 
 
@@ -308,24 +312,25 @@ class ClojureLSP(SolidLanguageServer):
         log.info(f"clojure-lsp source-paths scanned from project descriptors: {scanned}")
         return scanned
 
-    def _get_initialize_params(self) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """Returns the init params for clojure-lsp."""
-        repository_absolute_path = self.repository_root_path
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
         source_paths = self._resolve_source_paths()
 
         initialization_options: dict = {"dependency-scheme": "jar", "text-document-sync-kind": "incremental"}
         if source_paths is not None:
             initialization_options["source-paths"] = source_paths
 
-        result = {  # type: ignore
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
+        result = {
             "capabilities": {
                 "workspace": {
                     "applyEdit": True,
                     "workspaceEdit": {"documentChanges": True},
+                    # Serena notifies language servers about files changed outside its own
+                    # edit tools (git checkout, another editor, a build step) via
+                    # workspace/didChangeWatchedFiles; see LanguageServerManager.poll_and_notify.
+                    # Without declaring the capability, clojure-lsp is not told the client
+                    # sends those notifications and may keep answering from its stale analysis.
+                    "didChangeWatchedFiles": {"dynamicRegistration": True},
                     "symbol": {"symbolKind": {"valueSet": list(range(1, 27))}},
                     "workspaceFolders": True,
                 },
@@ -344,9 +349,8 @@ class ClojureLSP(SolidLanguageServer):
             },
             "initializationOptions": initialization_options,
             "trace": "off",
-            "workspaceFolders": [{"uri": root_uri, "name": os.path.basename(repository_absolute_path)}],
         }
-        return cast(InitializeParams, result)
+        return result
 
     def _start_server(self) -> None:
         def register_capability_handler(params: dict) -> None:
@@ -389,7 +393,7 @@ class ClojureLSP(SolidLanguageServer):
         log.info("Starting clojure-lsp server process")
         self.server.start()
 
-        initialize_params = self._get_initialize_params()
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)

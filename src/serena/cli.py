@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator, Sequence
 from logging import Logger
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import click
 from sensai.util import logging
@@ -37,11 +37,15 @@ from serena.constants import (
     SERENAS_OWN_MODE_YAMLS_DIR,
 )
 from serena.prompt_factory import SerenaPromptFactory
+from serena.tools import ActivateProjectTool
 from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
-from solidlsp.ls_config import Language
+from solidlsp.ls_config import LanguageServerId
 from solidlsp.ls_types import SymbolKind
 from solidlsp.util.subprocess_util import subprocess_kwargs
+
+if TYPE_CHECKING:
+    from serena.memories.memory_manager import MemoryManager
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +66,16 @@ For details on mode configuration, see
 def find_project_root(root: str | Path | None = None) -> str | None:
     """Find project root by walking up from CWD.
 
-    Checks for .serena/project.yml first (explicit Serena project), then .git (git root).
+    Returns the nearest ancestor that is either an explicit Serena project
+    (contains .serena/project.yml) or a git root (contains .git, which may be a
+    directory or, for git worktrees and submodules, a pointer file). The nearest
+    such directory wins; a .serena/project.yml at the same level takes priority
+    over .git only because they resolve to the same directory.
+
+    Walking up with a single pass (rather than searching all levels for
+    .serena/project.yml first and only then for .git) ensures a git worktree
+    nested under another Serena project resolves to the worktree itself, instead
+    of being hijacked by the ancestor project's .serena/project.yml.
 
     :param root: If provided, constrains the search to this directory and below
                  (acts as a virtual filesystem root). Search stops at this boundary.
@@ -79,14 +92,12 @@ def find_project_root(root: str | Path | None = None) -> str | None:
             if boundary is not None and parent == boundary:
                 return
 
-    # First pass: look for .serena
+    # Single pass: the nearest project boundary wins, whether it is an explicit
+    # Serena project (.serena/project.yml) or a git root (.git, a dir or a worktree
+    # pointer file). This keeps a nested git worktree from being hijacked by an
+    # ancestor's .serena/project.yml.
     for directory in ancestors():
-        if (directory / ".serena" / "project.yml").is_file():
-            return str(directory)
-
-    # Second pass: look for .git
-    for directory in ancestors():
-        if (directory / ".git").exists():  # .git can be file (worktree) or dir
+        if (directory / ".serena" / "project.yml").is_file() or (directory / ".git").exists():
             return str(directory)
 
     return None
@@ -174,9 +185,7 @@ class TopLevelCommands(AutoRegisteringGroup):
     )
     def init(language_backend: Literal["LSP", "JetBrains"] = "LSP") -> None:
         click.echo(f"\nSerena version: {serena_version()}\n")
-        serena_config = SerenaConfig.from_config_file()
-        serena_config.language_backend = LanguageBackend(language_backend)
-        serena_config.save()
+        serena_config = SerenaConfig.init(language_backend=LanguageBackend(language_backend))
         click.echo(f"Configuration file: {serena_config.config_file_path}")
         click.echo(f"Language backend: {language_backend}")
 
@@ -304,7 +313,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         "--project-from-cwd",
         is_flag=True,
         default=False,
-        help="Auto-detect project from current working directory (searches for .serena/project.yml or .git, falls back to CWD). Intended for CLI-based agents like Claude Code, Gemini and Codex.",
+        help="Auto-detect project from current working directory (nearest ancestor containing .serena/project.yml or .git). If none is found, no project is activated. Intended for CLI-based agents like Claude Code, Gemini and Codex.",
     )
     def start_mcp_server(
         project: str | None,
@@ -347,6 +356,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Storing logs in %s", log_path)
 
         # Handle --project-from-cwd flag
+        project_activation_error: str | None = None
         if project_from_cwd:
             if project is not None or project_file_arg is not None:
                 raise click.UsageError("--project-from-cwd cannot be used with --project or positional project argument")
@@ -354,7 +364,12 @@ class TopLevelCommands(AutoRegisteringGroup):
             if project is not None:
                 log.info("Auto-detected project root: %s", project)
             else:
-                log.warning("No project root found from %s; not activating any project", os.getcwd())
+                project_activation_error = (
+                    f"No project root found from cwd={os.getcwd()} (no .serena/project.yml or .git found); "
+                    "no project activated. If the folder is a coding project folder to be worked on, "
+                    f"activate the folder explicitly using the {ActivateProjectTool.get_name_from_cls()} tool."
+                )
+                log.warning(project_activation_error)
 
         project_file = project_file_arg or project
 
@@ -362,7 +377,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         if default_modes or added_modes:
             mode_selection_def = ModeSelectionDefinitionWithAddedModes(default_modes=default_modes or None, added_modes=added_modes or None)
 
-        factory = SerenaMCPFactory(context=context, project=project_file, memory_log_handler=memory_log_handler)
+        factory = SerenaMCPFactory(transport=transport, context=context, project=project_file, memory_log_handler=memory_log_handler)
         server = factory.create_mcp_server(
             host=host,
             port=port,
@@ -374,6 +389,7 @@ class TopLevelCommands(AutoRegisteringGroup):
             log_level=log_level,
             trace_lsp_communication=trace_lsp_communication,
             tool_timeout=tool_timeout,
+            project_activation_error=project_activation_error,
         )
         if project_file_arg:
             log.warning(
@@ -387,13 +403,7 @@ class TopLevelCommands(AutoRegisteringGroup):
     @click.command(
         "print-system-prompt", help="Print the system prompt for a project.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH}
     )
-    @click.argument("project", type=click.Path(exists=True), default=os.getcwd(), required=False)
-    @click.option(
-        "--log-level",
-        type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
-        default="WARNING",
-        help="Log level for prompt generation.",
-    )
+    @click.argument("project", type=click.Path(exists=True), default=None, required=False)
     @click.option("--only-instructions", is_flag=True, help="Print only the initial instructions, without prefix/postfix.")
     @click.option(
         "--context", type=str, default=DEFAULT_CONTEXT, show_default=True, help="Built-in context name or path to custom context YAML."
@@ -407,27 +417,19 @@ class TopLevelCommands(AutoRegisteringGroup):
         show_default=False,
         help=_MODES_EXPLANATION,
     )
-    def print_system_prompt(
-        project: str, log_level: str, only_instructions: bool, context: str, modes: Sequence[str] | None = None
-    ) -> None:
+    def print_system_prompt(project: str | None, only_instructions: bool, context: str, modes: Sequence[str] | None = None) -> None:
         from serena.agent import SerenaAgent
 
         prefix = "You will receive access to Serena's symbolic tools. Below are instructions for using them, take them into account."
         postfix = "You begin by acknowledging that you understood the above instructions and are ready to receive tasks."
 
-        lvl = logging.getLevelNamesMapping()[log_level.upper()]
-        logging.configure(level=lvl)
         context_instance = SerenaAgentContext.load(context)
         modes_selection_def: ModeSelectionDefinition | None = None
         if modes:
             modes_selection_def = ModeSelectionDefinition(default_modes=modes)
-        serena_config = SerenaConfig.from_config_file()
-        serena_config.web_dashboard = False
-        print(serena_config.default_modes)
-        print(serena_config.base_modes)
-
+        serena_config = SerenaConfig.from_config_file().with_headless_mode_overrides()
         agent = SerenaAgent(
-            project=os.path.abspath(project),
+            project=os.path.abspath(project) if project is not None else None,
             serena_config=serena_config,
             context=context_instance,
             modes=modes_selection_def,
@@ -487,11 +489,8 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Starting Serena project server")
         log.info("Storing logs in %s", log_path)
 
-        server = ProjectServer()
-        run_kwargs: dict[str, Any] = {"host": host}
-        if port is not None:
-            run_kwargs["port"] = port
-        server.run(**run_kwargs)
+        server = ProjectServer(host=host, port=port)
+        server.run()
 
     @staticmethod
     @click.command(
@@ -707,13 +706,13 @@ class ProjectCommands(AutoRegisteringGroup):
         if os.path.exists(yml_path):
             raise FileExistsError(f"Project file {yml_path} already exists.")
 
-        languages: list[Language] = []
+        languages: list[LanguageServerId] = []
         if language:
             for lang in language:
                 try:
-                    languages.append(Language(lang.lower()))
+                    languages.append(LanguageServerId(lang.lower()))
                 except ValueError:
-                    all_langs = [l.value for l in Language]
+                    all_langs = [l.value for l in LanguageServerId]
                     raise ValueError(f"Unknown language '{lang}'. Supported: {all_langs}")
 
         generated_conf = ProjectConfig.autogenerate(
@@ -723,8 +722,8 @@ class ProjectCommands(AutoRegisteringGroup):
             languages=languages if languages else None,
             interactive=True,
         )
-        languages_str = ", ".join([lang.value for lang in generated_conf.languages]) if generated_conf.languages else "N/A"
-        click.echo(f"Generated project with languages {{{languages_str}}} at {yml_path}.")
+        languages_str = ", ".join([lang.value for lang in generated_conf.language_servers]) if generated_conf.language_servers else "N/A"
+        click.echo(f"Generated project with language servers {{{languages_str}}} at {yml_path}.")
         registered_project = serena_config.get_registered_project(str(project_root))
         if registered_project is None:
             registered_project = RegisteredProject(str(project_root), generated_conf)
@@ -737,7 +736,12 @@ class ProjectCommands(AutoRegisteringGroup):
     @click.argument("project_path", type=click.Path(exists=True, file_okay=False), default=os.getcwd())
     @click.option("--name", type=str, default=None, help="Project name; defaults to directory name if not specified.")
     @click.option(
-        "--language", type=str, multiple=True, help="Programming language(s); inferred if not specified. Can be passed multiple times."
+        "--ls",
+        "--language",
+        "language",
+        type=str,
+        multiple=True,
+        help="Language server(s); inferred if not specified. Can be passed multiple times.",
     )
     @click.option("--index", is_flag=True, help="Index the project after creation.")
     @click.option(
@@ -767,10 +771,12 @@ class ProjectCommands(AutoRegisteringGroup):
     @click.argument("project", type=PROJECT_TYPE, default=os.getcwd(), required=False)
     @click.option("--name", type=str, default=None, help="Project name (only used if auto-creating project.yml).")
     @click.option(
+        "--ls",
         "--language",
+        "language",
         type=str,
         multiple=True,
-        help="Programming language(s) (only used if auto-creating project.yml). Inferred if not specified.",
+        help="Language server(s) (only used if auto-creating project.yml). Inferred if not specified.",
     )
     @click.option(
         "--log-level",
@@ -807,13 +813,13 @@ class ProjectCommands(AutoRegisteringGroup):
 
             collected_exceptions: list[Exception] = []
             files_failed = []
-            language_file_counts: dict[Language, int] = collections.defaultdict(lambda: 0)
+            language_file_counts: dict[LanguageServerId, int] = collections.defaultdict(lambda: 0)
             last_save_time = time.monotonic()
             for i, f in enumerate(tqdm(files, desc="Indexing")):
                 try:
                     ls = ls_mgr.get_language_server(f)
                     ls.request_document_symbols(f)
-                    language_file_counts[ls.language] += 1
+                    language_file_counts[ls.ls_id] += 1
                 except Exception as e:
                     log.error(f"Failed to index {f}, continuing.")
                     collected_exceptions.append(e)
@@ -887,18 +893,24 @@ class ProjectCommands(AutoRegisteringGroup):
             exit(1)
         ls_mgr = proj.create_language_server_manager()
         try:
-            for ls in ls_mgr.iter_language_servers():
-                click.echo(f"Indexing for language {ls.language.value} …")
-                document_symbols = ls.request_document_symbols(file)
-                symbols, _ = document_symbols.get_all_symbols_and_roots()
-                if verbose:
-                    click.echo(f"Symbols in file '{file}':")
-                    for symbol in symbols:
-                        click.echo(f"  - {symbol['name']} at line {symbol['selectionRange']['start']['line']} of kind {symbol['kind']}")
-                ls.save_cache()
-                click.echo(f"Successfully indexed file '{file}', {len(symbols)} symbols saved to cache in {ls.cache_dir}.")
+            ls = ls_mgr.get_language_server(file)
+            click.echo(f"Indexing for language {ls.ls_id.value} …")
+            document_symbols = ls.request_document_symbols(file)
+            symbols, _ = document_symbols.get_all_symbols_and_roots()
+            if verbose:
+                click.echo(f"Symbols in file '{file}':")
+                for symbol in symbols:
+                    click.echo(f"  - {symbol['name']} at line {symbol['selectionRange']['start']['line']} of kind {symbol['kind']}")
+            ls.save_cache()
+            click.echo(f"Successfully indexed file '{file}', {len(symbols)} symbols saved to cache in {ls.cache_dir}.")
         finally:
             ls_mgr.stop_all()
+
+    class _HealthCheckFailure(Exception):
+        """
+        A condition under which the health check is to be considered failed.
+        The exception message is the explanation presented to the user.
+        """
 
     @staticmethod
     @click.command(
@@ -909,21 +921,19 @@ class ProjectCommands(AutoRegisteringGroup):
     @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
     def health_check(project: str) -> None:
         """
-        Perform a comprehensive health check of the project's tools and language server.
+        Perform a basic health check which checks whether language server tools are functional for the project.
 
         :param project: path to the project directory, defaults to the current working directory.
         """
         # NOTE: completely written by Claude Code, only functionality was reviewed, not implementation
         from serena.agent import SerenaAgent
         from serena.project import Project
-        from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool
+        from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool
 
         logging.configure(level=logging.INFO)
         project_path = os.path.abspath(project)
-        serena_config = SerenaConfig.from_config_file()
+        serena_config = SerenaConfig.from_config_file().with_headless_mode_overrides()
         serena_config.language_backend = LanguageBackend.LSP
-        serena_config.gui_log_window = False
-        serena_config.web_dashboard = False
         proj = Project.load(project_path, serena_config=serena_config)
 
         # Create log file with timestamp
@@ -931,6 +941,9 @@ class ProjectCommands(AutoRegisteringGroup):
         log_dir = os.path.join(project_path, ".serena", "logs", "health-checks")
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, f"health_check_{timestamp}.log")
+
+        # the check's verdict: the explanation of the failure, or None if the check passed (see below)
+        failure_reason: str | None = None
 
         with FileLoggerContext(log_file, append=False, enabled=True):
             log.info("Starting health check for project: %s", project_path)
@@ -950,7 +963,7 @@ class ProjectCommands(AutoRegisteringGroup):
                 for file_path in files:
                     try:
                         full_path = os.path.join(project_path, file_path)
-                        if os.path.getsize(full_path) > 0:
+                        if os.path.getsize(full_path) > 1000:
                             target_file = file_path
                             log.info("Found analyzable file: %s", target_file)
                             break
@@ -958,16 +971,12 @@ class ProjectCommands(AutoRegisteringGroup):
                         continue
 
                 if not target_file:
-                    log.error("No analyzable files found in project")
-                    click.echo("❌ Health check failed: No analyzable files found")
-                    click.echo(f"Log saved to: {log_file}")
-                    return
+                    raise ProjectCommands._HealthCheckFailure("No analyzable files found")
 
                 # Get tools from agent
                 overview_tool = agent.get_tool(GetSymbolsOverviewTool)
                 find_symbol_tool = agent.get_tool(FindSymbolTool)
                 find_refs_tool = agent.get_tool(FindReferencingSymbolsTool)
-                search_pattern_tool = agent.get_tool(SearchForPatternTool)
 
                 # Test 1: Get symbols overview
                 log.info("Testing GetSymbolsOverviewTool on file: %s", target_file)
@@ -975,10 +984,7 @@ class ProjectCommands(AutoRegisteringGroup):
                 log.info(f"GetSymbolsOverviewTool returned: {overview_data}")
 
                 if not overview_data:
-                    log.error("No symbols found in file %s", target_file)
-                    click.echo("❌ Health check failed: No symbols found in target file")
-                    click.echo(f"Log saved to: {log_file}")
-                    return
+                    raise ProjectCommands._HealthCheckFailure(f"No symbols found in target file {target_file}")
 
                 # Extract suitable symbol (prefer class or function over variables)
                 preferred_kinds = {SymbolKind.Class.name, SymbolKind.Function.name, SymbolKind.Method.name, SymbolKind.Constructor.name}
@@ -999,57 +1005,49 @@ class ProjectCommands(AutoRegisteringGroup):
 
                 # Test 2: FindSymbolTool
                 log.info("Testing FindSymbolTool for symbol: %s", symbol_name)
-                find_symbol_result = agent.execute_task(
-                    lambda: find_symbol_tool.apply(symbol_name, relative_path=target_file, include_body=True)
-                )
+                with find_symbol_tool.symbol_dict_grouper.disabled_context():
+                    find_symbol_result = agent.execute_task(
+                        lambda: find_symbol_tool.apply(symbol_name, relative_path=target_file, include_body=True)
+                    )
                 find_symbol_data = json.loads(find_symbol_result)
                 log.info("FindSymbolTool found %d matches for symbol %s", len(find_symbol_data), symbol_name)
+                if not find_symbol_data:
+                    raise ProjectCommands._HealthCheckFailure("FindSymbolTool returned no results")
 
                 # Test 3: FindReferencingSymbolsTool
                 log.info("Testing FindReferencingSymbolsTool for symbol: %s", symbol_name)
                 try:
-                    find_refs_result = agent.execute_task(lambda: find_refs_tool.apply(symbol_name, relative_path=target_file))
-                    find_refs_data = json.loads(find_refs_result)
-                    log.info("FindReferencingSymbolsTool found %d references for symbol %s", len(find_refs_data), symbol_name)
+                    with find_refs_tool.symbol_dict_grouper.disabled_context():
+                        find_refs_result = agent.execute_task(lambda: find_refs_tool.apply(symbol_name, relative_path=target_file))
+                        find_refs_data = json.loads(find_refs_result)
+                        log.info("FindReferencingSymbolsTool found %d references for symbol %s", len(find_refs_data), symbol_name)
                 except Exception as e:
-                    log.warning("FindReferencingSymbolsTool failed for symbol %s: %s", symbol_name, str(e))
-                    find_refs_data = []
-
-                # Test 4: SearchForPatternTool to verify references
-                log.info("Testing SearchForPatternTool for pattern: %s", symbol_name)
-                try:
-                    search_result = agent.execute_task(
-                        lambda: search_pattern_tool.apply(substring_pattern=symbol_name, restrict_search_to_code_files=True)
-                    )
-                    search_data = json.loads(search_result)
-                    pattern_matches = sum(len(matches) for matches in search_data.values())
-                    log.info("SearchForPatternTool found %d pattern matches for %s", pattern_matches, symbol_name)
-                except Exception as e:
-                    log.warning("SearchForPatternTool failed for pattern %s: %s", symbol_name, str(e))
-                    pattern_matches = 0
-
-                # Verify tools worked as expected
-                tools_working = True
-                if not find_symbol_data:
-                    log.error("FindSymbolTool returned no results")
-                    tools_working = False
-
-                if len(find_refs_data) == 0 and pattern_matches == 0:
-                    log.warning("Both FindReferencingSymbolsTool and SearchForPatternTool found no matches - this might indicate an issue")
+                    # A symbol with no references at all is a legitimate result, so the number of
+                    # references is not asserted - but a *failure* of the reference search means the
+                    # language server is not functional, which is the single thing this command is
+                    # asked to determine. Logging it as a warning let the command print
+                    # "All tools working correctly" and exit 0 after the search had already failed.
+                    raise ProjectCommands._HealthCheckFailure(f"FindReferencingSymbolsTool failed for symbol {symbol_name}: {e}") from e
 
                 log.info("Health check completed successfully")
 
-                if tools_working:
-                    click.echo("✅ Health check passed - All tools working correctly")
-                else:
-                    click.echo("⚠️  Health check completed with warnings - Check log for details")
-
+            # expected failures and unexpected exceptions are reported alike: both mean the project's
+            # tooling is not functional, which is the single thing this command is asked to determine
             except Exception as e:
                 log.exception("Health check failed with exception: %s", str(e))
-                click.echo(f"❌ Health check failed: {e!s}")
+                failure_reason = str(e)
 
             finally:
                 click.echo(f"Log saved to: {log_file}")
+
+        # the verdict is reported outside the checked region, so that a failure to write the report
+        # cannot be mistaken for a failure of the check itself; the exit code lets callers
+        # (CI, scripts) act on the verdict
+        if failure_reason is None:
+            click.echo("✅ Health check passed - All tools working correctly")
+        else:
+            click.echo(f"❌ Health check failed: {failure_reason}")
+            raise SystemExit(1)
 
 
 class ToolCommands(AutoRegisteringGroup):
@@ -1105,12 +1103,282 @@ class ToolCommands(AutoRegisteringGroup):
 
         agent = SerenaAgent(
             project=None,
-            serena_config=SerenaConfig(web_dashboard=False, log_level=logging.INFO),
+            serena_config=SerenaConfig(log_level=logging.INFO).with_headless_mode_overrides(),
             context=serena_context,
         )
         tool = agent.get_tool_by_name(tool_name)
         mcp_tool = SerenaMCPFactory.make_mcp_tool(tool)
         click.echo(mcp_tool.description)
+
+
+class MemoryCommands(AutoRegisteringGroup):
+    """Group for 'memories' subcommands; manage and inspect a project's memory files."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="memories",
+            help="Inspect, read, write, and validate Serena memories. "
+            "You can run `serena memories <command> --help` for more info on each command.",
+        )
+
+    @staticmethod
+    def _load_memories_manager(project: str) -> "MemoryManager":
+        """
+        Load the project at ``project`` and return its memories manager.
+
+        Requires the project to already be a Serena project (``.serena/project.yml`` must
+        exist at the configured location). Never auto-creates the ``.serena`` directory —
+        if no project configuration is found, the user is directed at ``serena project create``.
+        """
+        serena_config = SerenaConfig.from_config_file()
+        registered_project = serena_config.get_registered_project(project)
+        if registered_project is None:
+            raise click.UsageError(f"No Serena project found for '{project}'. Create one first.")
+        return registered_project.get_project_instance(serena_config).memory_manager
+
+    @staticmethod
+    @click.command(
+        "initialize",
+        help=(
+            "Initialize this project's memory layout by seeding the `memory_maintenance` memory. "
+            "Requires the project to already exist as a Serena project (run `serena project create` first); "
+            "this command does not create a `.serena` directory on its own. "
+            "If a `global/memory_maintenance` memory exists, it takes precedence and no project copy is created."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def initialize(project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        name = manager.ensure_memory_maintenance_memory()
+        click.echo(f"Memory maintenance memory ready: `mem:{name}`.")
+
+    @staticmethod
+    @click.command(
+        "list",
+        help="List memories of the active project (and global memories).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--topic", "-t", type=str, default="", help="Restrict the listing to a single topic (e.g. 'auth' or 'global/style').")
+    def list(project: str, topic: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        memories = manager.list_memories(topic=topic)
+        if not len(memories):
+            click.echo("(no memories found)")
+            return
+        if memories.memories:
+            click.echo("Project memories:")
+            for name in sorted(memories.memories):
+                click.echo(f"  - {name}")
+        if memories.read_only_memories:
+            click.echo("Read-only memories:")
+            for name in sorted(memories.read_only_memories):
+                click.echo(f"  - {name}")
+
+    @staticmethod
+    @click.command("read", help="Print the content of a memory to stdout.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def read(memory_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.load_memory(memory_name))
+
+    @staticmethod
+    @click.command(
+        "write",
+        help="Write a memory file. Reads the content from --content, --file, or stdin (in that order of precedence).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--content", type=str, default=None, help="Memory content provided directly on the command line.")
+    @click.option(
+        "--file", "file_path", type=click.Path(exists=True, dir_okay=False), default=None, help="Read memory content from the given file."
+    )
+    def write(memory_name: str, project: str, content: str | None, file_path: str | None) -> None:
+        if content is None and file_path is not None:
+            with open(file_path, encoding="utf-8") as f:
+                content = f.read()
+        if content is None:
+            content = sys.stdin.read()
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.save_memory(memory_name, content, is_tool_context=False))
+
+    @staticmethod
+    @click.command(
+        "delete",
+        help="Delete a memory file. Use the `global/` prefix to address a global memory (e.g. `global/style_guide`).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def delete(memory_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.delete_memory(memory_name, is_tool_context=False))
+
+    @staticmethod
+    @click.command(
+        "rename",
+        help=(
+            "Rename or move a memory and update every `mem:OLD_NAME` reference across all memories. "
+            "Use `/` in the name to organize into topics; use the `global/` prefix to address a "
+            "global memory. Moving between project and global scope is supported."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("old_name", type=str)
+    @click.argument("new_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def rename(old_name: str, new_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        message, n_refs = manager.rename_memory_and_propagate_references(old_name, new_name, is_tool_context=False)
+        click.echo(message)
+        if n_refs > 0:
+            click.echo(f"Updated {n_refs} `mem:` reference occurrence(s) across the memory graph.")
+
+    @staticmethod
+    @click.command(
+        "edit",
+        help=(
+            "Replace content matching a pattern in a memory. By default operates in literal "
+            "(non-regex) mode and refuses to replace more than one occurrence; pass --mode regex "
+            "to enable regex matching and --allow-multiple-occurrences to permit multiple hits."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--needle", type=str, required=True, help="The text to search for (literal by default; regex if --mode=regex).")
+    @click.option("--repl", type=str, required=True, help="The replacement text (verbatim).")
+    @click.option(
+        "--mode",
+        type=click.Choice(["literal", "regex"]),
+        default="literal",
+        show_default=True,
+        help="Treat --needle as literal text or as a Python regex (MULTILINE and DOTALL flags enabled).",
+    )
+    @click.option(
+        "--allow-multiple-occurrences",
+        is_flag=True,
+        default=False,
+        help="Permit and apply multiple matches; without this, multiple matches raise an error.",
+    )
+    def edit(
+        memory_name: str,
+        project: str,
+        needle: str,
+        repl: str,
+        mode: Literal["literal", "regex"],
+        allow_multiple_occurrences: bool,
+    ) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(
+            manager.edit_memory(
+                memory_name,
+                needle,
+                repl,
+                mode,
+                allow_multiple_occurrences,
+                is_tool_context=False,
+            )
+        )
+
+    @staticmethod
+    @click.command(
+        "check",
+        help=(
+            "Check referential integrity across all memories of the project (and global memories). "
+            "By default reports only stale `mem:` references. Pass --include-unmarked to also report "
+            "bare occurrences of existing memory names (exact matches) and --fuzzy-matching (only "
+            "meaningful in combination with --include-unmarked) to additionally report fuzzy "
+            "near-misses. Read-only and never writes. Always exits 0."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option(
+        "--include-unmarked",
+        is_flag=True,
+        default=False,
+        help="Also report bare exact occurrences of existing memory names (i.e. without the `mem:` prefix).",
+    )
+    @click.option(
+        "--fuzzy-matching",
+        is_flag=True,
+        default=False,
+        help=(
+            "Additionally report fuzzy near-misses (long bare tokens that similarity-match an existing "
+            "memory name). Only meaningful together with --include-unmarked; ignored otherwise."
+        ),
+    )
+    def check(project: str, include_unmarked: bool, fuzzy_matching: bool) -> None:
+        if fuzzy_matching and not include_unmarked:
+            click.echo(
+                "Warning: --fuzzy-matching has no effect without --include-unmarked; ignoring it.",
+                err=True,
+            )
+        manager = MemoryCommands._load_memories_manager(project)
+        report = manager.validate_referential_integrity(
+            include_unmarked=include_unmarked,
+            include_fuzzy_matching=fuzzy_matching,
+        )
+        click.echo(report.format())
+
+    @staticmethod
+    @click.command(
+        "auto-prefix-references",
+        help=(
+            "Rewrite exact bare occurrences of existing memory names by adding the `mem:` prefix. "
+            "This is a heuristic, file-mutating operation: a word that happens to coincide with a memory name "
+            "will be rewritten as a reference even if it was intended as ordinary prose. "
+            "Use --dry-run to preview the rewrites without modifying any files. "
+            "\n\n"
+            "Scope is narrower than what `serena memories check` reports. Only EXACT bare occurrences are rewritten "
+            "(the body text must equal an existing memory name verbatim); fuzzy near-miss findings surfaced by `check` "
+            "are NOT autofixable here, since rewriting them would require substring substitution rather than a prefix "
+            "addition — they are reported for manual review. "
+            "By default the rewrite is further restricted to memory names containing `/` or longer than the configured "
+            "threshold, and skips global and read-only memories; use the --include-* flags below to widen the scope."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option(
+        "--dry-run",
+        is_flag=True,
+        default=False,
+        help="Preview the rewrites this command would apply; do not modify any files.",
+    )
+    @click.option(
+        "--include-flat-names",
+        is_flag=True,
+        default=False,
+        help="Also rewrite short, flat memory names (no `/`, below the length threshold). Raises false-positive risk significantly.",
+    )
+    @click.option(
+        "--include-read-only",
+        is_flag=True,
+        default=False,
+        help="Also rewrite occurrences inside read-only memories.",
+    )
+    @click.option(
+        "--include-global",
+        is_flag=True,
+        default=False,
+        help="Also rewrite occurrences inside global memories (affects every project consuming them).",
+    )
+    def auto_prefix_references(
+        project: str, dry_run: bool, include_flat_names: bool, include_read_only: bool, include_global: bool
+    ) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        report = manager.auto_prefix_bare_references(
+            include_flat_names=include_flat_names,
+            include_read_only=include_read_only,
+            include_global=include_global,
+            dry_run=dry_run,
+        )
+        click.echo(report.format())
 
 
 class PromptCommands(AutoRegisteringGroup):
@@ -1244,10 +1512,11 @@ _project = ProjectCommands()
 _config = SerenaConfigCommands()
 _tools = ToolCommands()
 _prompts = PromptCommands()
+_memories = MemoryCommands()
 
 # Expose so we can use this as an entrypoint
 top_level = TopLevelCommands()
 
 # needed for the help script to work - register all subcommands to the top-level group
-for subgroup in (_mode, _context, _project, _config, _tools, _prompts):
+for subgroup in (_mode, _context, _project, _config, _tools, _prompts, _memories):
     top_level.add_command(subgroup)

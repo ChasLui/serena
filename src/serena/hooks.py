@@ -22,14 +22,16 @@ class HookClient(Enum):
     """The client application that triggered the hook."""
 
     CLAUDE_CODE = "claude-code"
+    CODEBUDDY = "codebuddy"
     VSCODE = "vscode"
     CODEX = "codex"
+    GROK = "grok"
 
 
 class Hook(ABC):
     def __init__(self, client: HookClient):
         raw = sys.stdin.read()
-        input_data = json.loads(raw)
+        input_data = json.loads(raw, strict=False)
         self._input_data = input_data
         self._client = client
 
@@ -46,23 +48,31 @@ class Hook(ABC):
         pass
 
 
-class PreToolUseHook(Hook, ABC):
-    _NON_SYMBOLIC_SERENA_TOOL_NAME_SUBSTRINGS = frozenset(
-        (
-            "pattern",
-            "read",
-            "diagnostics",
-            "memory",
-            "onboarding",
-            "config",
-            "list_file",
-            "find_file",
-            "shell",
-            "dashboard",
-            "restart_language_server",
-        )
+#: substrings that mark a "serena"-containing tool name as one of Serena's own non-symbolic
+#: utilities (read/config/dashboard/shell) rather than a code-navigation tool; shared across
+#: PreToolUse and PostToolUse hooks so both classify a call the same way.
+_NON_SYMBOLIC_SERENA_TOOL_NAME_SUBSTRINGS = frozenset(
+    (
+        "pattern",
+        "read",
+        "diagnostics",
+        "memory",
+        "onboarding",
+        "config",
+        "list_file",
+        "find_file",
+        "shell",
+        "dashboard",
+        "restart_language_server",
     )
+)
 
+
+def _is_serena_symbolic_tool_name(tool_name: str) -> bool:
+    return "serena" in tool_name and not any(substring in tool_name for substring in _NON_SYMBOLIC_SERENA_TOOL_NAME_SUBSTRINGS)
+
+
+class PreToolUseHook(Hook, ABC):
     def __init__(self, client: HookClient):
         super().__init__(client)
         _tool_name = self._input_data.get("tool_name") or self._input_data.get("toolName", "") or ""
@@ -70,7 +80,11 @@ class PreToolUseHook(Hook, ABC):
         if not _tool_name:
             raise ValueError("Tool name is required in the hook input data")
         self._tool_name = _tool_name
-        self._tool_input: dict | None = self._input_data.get("tool_input") or self._input_data.get("toolInput")
+        raw_tool_input = self._input_data.get("tool_input") or self._input_data.get("toolInput")
+        # TODO: some agents, like copilot CLI, can send a string as value for raw_tool_input
+        #  Example: "tool_input":"*** Begin Patch\n*** Add File: /Users/acbdef/.copilot/session-state/08a961db-02f0-4c7c-b783-1e9818290292/files/hook-tool-test-3.txt\n+third edit tool test\n*** End Patch\n"
+        #  We currently don't parse such tool input and hence don't react to it in hooks
+        self._tool_input: dict | None = raw_tool_input if isinstance(raw_tool_input, dict) else None
 
         # only relevant in claude code at the moment, (not all events include this field; default to empty string)
         raw_permission_mode = self._input_data.get("permission_mode") or self._input_data.get("permissionMode") or ""
@@ -83,6 +97,12 @@ class PreToolUseHook(Hook, ABC):
         additional_context: str = ""
 
         def to_json_string(self, client: HookClient) -> str:
+            if client == HookClient.GROK:
+                grok_output: dict[str, str] = {"decision": self.permission_decision}
+                if self.permission_decision == "deny":
+                    grok_output["reason"] = self.permission_decision_reason
+                return json.dumps(grok_output)
+
             hook_output = {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -95,9 +115,7 @@ class PreToolUseHook(Hook, ABC):
             return json.dumps(hook_output)
 
     def is_serena_symbolic_tool(self) -> bool:
-        return "serena" in self._tool_name and not any(
-            substring in self._tool_name for substring in self._NON_SYMBOLIC_SERENA_TOOL_NAME_SUBSTRINGS
-        )
+        return _is_serena_symbolic_tool_name(self._tool_name)
 
 
 class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
@@ -262,16 +280,18 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
     #: are caught alongside ``read_file``, while ``write_file``/``edit_file`` are not.
     _READ_FILE_VERB_SUBSTRINGS: frozenset[str] = frozenset(("read", "view", "open", "show"))
 
-    #: Shell commands that perform grep-like search; used to classify Codex
+    #: Shell commands that perform grep-like search; used to classify Codex/Grok
     #: shell-command tool calls whose ``cmd`` or ``command`` field starts with one of these.
     _GREP_SHELL_COMMANDS: frozenset[str] = frozenset(("grep", "rg", "ag", "ack", "fgrep", "egrep", "search_for_pattern"))
 
-    #: Shell commands that perform file-read operations; used to classify Codex
+    #: Shell commands that perform file-read operations; used to classify Codex/Grok
     #: shell-command tool calls whose ``cmd`` or ``command`` field starts with one of these.
     _READ_SHELL_COMMANDS: frozenset[str] = frozenset(("cat", "head", "tail", "sed", "less", "more", "bat", "get-content", "gc"))
 
     #: file suffixes for source-like files where symbolic tools are usually more
     #: appropriate than repeated raw reads. Lowercase and extension-only.
+    #: Note: ``search_for_pattern`` is always available regardless of extension and
+    #: is a better alternative to repeated raw reads for any structured file type.
     _CODE_FILE_EXTENSIONS: frozenset[str] = frozenset(
         (
             ".al",
@@ -289,14 +309,19 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             ".fs",
             ".fsx",
             ".go",
+            ".graphql",
+            ".gql",
             ".groovy",
             ".h",
+            ".hcl",
             ".hpp",
             ".hs",
             ".html",
             ".java",
             ".jl",
             ".js",
+            ".json",
+            ".jsonc",
             ".jsx",
             ".kt",
             ".kts",
@@ -304,7 +329,9 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             ".lua",
             ".m",
             ".matlab",
+            ".nf",
             ".php",
+            ".proto",
             ".ps1",
             ".py",
             ".r",
@@ -313,11 +340,17 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             ".scala",
             ".sh",
             ".sol",
+            ".sql",
             ".svelte",
             ".swift",
+            ".tf",
+            ".tfvars",
+            ".toml",
             ".ts",
             ".tsx",
             ".vue",
+            ".yaml",
+            ".yml",
             ".zig",
         )
     )
@@ -326,7 +359,7 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         super().__init__(client)
         self._tool_call_counter = self.ToolUseCounter.load(self)
 
-        # extract a shell ``cmd``/``command`` field (Codex shell-command-style payloads):
+        # extract a shell ``cmd``/``command`` field (Codex/Grok shell-command-style payloads):
         # split into command name (basename, lowercased) and the remaining argument string
         # so both bare names (``rg``) and path-prefixed invocations (``/usr/bin/grep``) are
         # normalised the same way. Stays ``None`` when no shell command is present.
@@ -337,26 +370,36 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         # payloads pass the target as ``file_path`` rather than via a shell command).
         self._file_path: str | None = None
         if self._tool_input is not None:
-            self._command = self._tool_input.get("cmd", self._tool_input.get("command", "")).strip()
+            self._command = str(self._tool_input.get("cmd", self._tool_input.get("command", ""))).strip()
             if self._command:
                 cmd_split = self._command.split(maxsplit=1)
                 if len(cmd_split) > 1:
                     self._command_args_str = cmd_split[1]
                 self._command_name = os.path.basename(cmd_split[0]).lower()
-            file_path = self._tool_input.get("file_path") or self._tool_input.get("filePath") or ""
+            file_path = (
+                self._tool_input.get("file_path")
+                or self._tool_input.get("filePath")
+                or self._tool_input.get("target_file")
+                or self._tool_input.get("targetFile")
+                or ""
+            )
             self._file_path = str(file_path).strip() or None
 
     def is_grep_call(self) -> bool:
-        if self._client == HookClient.CLAUDE_CODE:
+        if self._client in (HookClient.CLAUDE_CODE, HookClient.CODEBUDDY):
             return self._tool_name == "grep" or "search_for_pattern" in self._tool_name
+        if self._client == HookClient.GROK:
+            return self._tool_name == "grep" or (self._is_shell_command_call() and self._command_name in self._GREP_SHELL_COMMANDS)
         if self._client == HookClient.CODEX and self._is_shell_command_call():
             return self._command_name in self._GREP_SHELL_COMMANDS
         # heuristic for other clients
         return "grep" in self._tool_name
 
     def is_read_call(self) -> bool:
-        if self._client == HookClient.CLAUDE_CODE:
+        if self._client in (HookClient.CLAUDE_CODE, HookClient.CODEBUDDY):
             return self._tool_name == "read" or "read_file" in self._tool_name
+        if self._client == HookClient.GROK:
+            return self._tool_name == "read_file" or (self._is_shell_command_call() and self._command_name in self._READ_SHELL_COMMANDS)
         if self._client == HookClient.CODEX and self._is_shell_command_call():
             return self._command_name in self._READ_SHELL_COMMANDS
         # heuristic for other clients
@@ -381,7 +424,7 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         if self._file_path is not None:
             return self._is_code_file_path(self._file_path)
 
-        if self._client == HookClient.CODEX and self._command_args_str is not None:
+        if self._client in (HookClient.CODEX, HookClient.GROK) and self._command_args_str is not None:
             return any(self._is_code_file_path(argument) for argument in self._iter_shell_path_arguments())
 
         return True
@@ -482,6 +525,48 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
                 "now if needed, the counter was reset."
             ),
         )
+
+
+class PostToolUseResetSymbolicToolCounterHook(Hook):
+    """Post-tool-use hook that resets :class:`PreToolUseRemindAboutSymbolicToolsHook`'s
+    persisted counters after a successful Serena symbolic tool call.
+
+    ``PreToolUseRemindAboutSymbolicToolsHook`` already resets on a Serena tool call, but
+    only when it is itself invoked for that call, which requires the client's PreToolUse
+    matcher to observe ``mcp__serena__*`` tool names. Codex's documented wiring (see
+    docs/02-usage/030_clients.md) attaches ``remind`` to the ``Bash`` matcher only, so it
+    is never invoked for Serena's own tools there and the reset branch is unreachable.
+    This hook closes that gap from the other side of the call: wired to PostToolUse with a
+    matcher on Serena's tools, it fires once the call has completed.
+
+    Gated on the call having succeeded (``tool_response`` carrying no ``isError: true``,
+    the MCP ``tools/call`` result shape) so a failed Serena call does not mask a real
+    grep/read-drift streak the agent is still in.
+    """
+
+    def __init__(self, client: HookClient):
+        super().__init__(client)
+        raw_tool_name = self._input_data.get("tool_name") or self._input_data.get("toolName", "") or ""
+        tool_name = str(raw_tool_name).lower().strip()
+        if not tool_name:
+            raise ValueError("Tool name is required in the hook input data")
+        self._tool_name = tool_name
+        raw_tool_response = self._input_data.get("tool_response") or self._input_data.get("toolResponse")
+        self._tool_response: dict | None = raw_tool_response if isinstance(raw_tool_response, dict) else None
+
+    def _call_succeeded(self) -> bool:
+        # no structured response to check: be conservative and treat it as not confirmed
+        # successful, rather than resetting on data we can't actually read
+        if self._tool_response is None:
+            return False
+        return self._tool_response.get("isError") is not True
+
+    def execute(self) -> None:
+        if not _is_serena_symbolic_tool_name(self._tool_name) or not self._call_succeeded():
+            return
+        counter = PreToolUseRemindAboutSymbolicToolsHook.ToolUseCounter.load(self)
+        counter.reset()
+        counter.save(self)
 
 
 class SessionStartActivateProjectHook(Hook):
@@ -592,6 +677,17 @@ class HookCommands(AutoRegisteringGroup):
     @_client_option
     def auto_approve(client: str) -> None:
         PreToolUseAutoApproveSerenaHook(HookClient(client)).execute()
+
+    @staticmethod
+    @click.command(
+        "reset",
+        help="Set this as hook at PostToolUse, matched to Serena's own tools, to reset the grep/read-drift "
+        "counters after a successful Serena tool call. For clients whose PreToolUse wiring does not observe "
+        "Serena tool calls (e.g. Codex, matched to Bash only); complements `remind`'s own reset branch.",
+    )
+    @_client_option
+    def reset(client: str) -> None:
+        PostToolUseResetSymbolicToolCounterHook(HookClient(client)).execute()
 
 
 hook_commands = HookCommands()

@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,8 @@ from serena.config.serena_config import (
     SerenaConfigError,
 )
 from serena.constants import PROJECT_TEMPLATE_FILE, SERENA_MANAGED_DIR_NAME
-from serena.project import MemoriesManager, Project
-from solidlsp.ls_config import Language
+from serena.project import MemoryManager, Project
+from solidlsp.ls_config import LanguageServerId
 from test.conftest import create_default_serena_config
 
 
@@ -41,7 +42,7 @@ class TestProjectConfigAutogenerate:
         config = ProjectConfig.autogenerate(self.project_path, self.serena_config, save_to_disk=False)
 
         assert config.project_name == self.project_path.name
-        assert config.languages == []
+        assert config.language_servers == []
 
     def test_autogenerate_empty_directory_logs_warning(self, caplog):
         """Test that autogenerate logs a warning when no language files are found."""
@@ -61,7 +62,23 @@ class TestProjectConfigAutogenerate:
 
         # Verify the configuration
         assert config.project_name == self.project_path.name
-        assert config.languages == [Language.PYTHON]
+        assert config.language_servers == [LanguageServerId.PYTHON]
+
+    def test_autogenerate_with_python_files_and_custom_ls_priorities(self):
+        """Test successful autogeneration with Python source files, using custom language server priorities."""
+        # Create a Python file
+        python_file = self.project_path / "main.py"
+        python_file.write_text("def hello():\n    print('Hello, world!')\n")
+
+        serena_config = deepcopy(self.serena_config)
+        serena_config.ls_priorities = {LanguageServerId.PYTHON_TY.value: 3}
+
+        # Run autogenerate
+        config = ProjectConfig.autogenerate(self.project_path, serena_config, save_to_disk=False)
+
+        # Verify the configuration
+        assert config.project_name == self.project_path.name
+        assert config.language_servers == [LanguageServerId.PYTHON_TY]
 
     def test_autogenerate_with_js_files(self):
         """Test successful autogeneration with JavaScript source files."""
@@ -71,7 +88,7 @@ class TestProjectConfigAutogenerate:
         # Run autogenerate - should pick Python as dominant
         config = ProjectConfig.autogenerate(self.project_path, self.serena_config, save_to_disk=False)
 
-        assert config.languages == [Language.TYPESCRIPT]
+        assert config.language_servers == [LanguageServerId.TYPESCRIPT]
 
     def test_autogenerate_with_multiple_languages(self):
         """Test autogeneration picks dominant language when multiple are present."""
@@ -83,7 +100,7 @@ class TestProjectConfigAutogenerate:
         # Run autogenerate - should pick Python as dominant
         config = ProjectConfig.autogenerate(self.project_path, self.serena_config, save_to_disk=False)
 
-        assert config.languages == [Language.PYTHON]
+        assert config.language_servers == [LanguageServerId.PYTHON]
 
     def test_autogenerate_saves_to_disk(self):
         """Test that autogenerate can save the configuration to disk."""
@@ -99,7 +116,7 @@ class TestProjectConfigAutogenerate:
         assert config_path.exists()
 
         # Verify the content
-        assert config.languages == [Language.GO]
+        assert config.language_servers == [LanguageServerId.GO]
 
     def test_autogenerate_nonexistent_path(self):
         """Test that autogenerate raises FileNotFoundError for non-existent path."""
@@ -123,7 +140,7 @@ class TestProjectConfigAutogenerate:
         config = ProjectConfig.autogenerate(self.project_path, self.serena_config, save_to_disk=False)
 
         assert config.project_name == self.project_path.name
-        assert config.languages == []
+        assert config.language_servers == []
 
     def test_autogenerate_custom_project_name(self):
         """Test autogenerate with custom project name."""
@@ -136,7 +153,7 @@ class TestProjectConfigAutogenerate:
         config = ProjectConfig.autogenerate(self.project_path, self.serena_config, project_name=custom_name, save_to_disk=False)
 
         assert config.project_name == custom_name
-        assert config.languages == [Language.TYPESCRIPT]
+        assert config.language_servers == [LanguageServerId.TYPESCRIPT]
 
 
 class TestProjectConfig:
@@ -151,14 +168,14 @@ class TestProjectConfigLanguageBackend:
     def test_language_backend_defaults_to_none(self):
         config = ProjectConfig(
             project_name="test",
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
         )
         assert config.language_backend is None
 
     def test_language_backend_can_be_set(self):
         config = ProjectConfig(
             project_name="test",
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
             language_backend=LanguageBackend.JETBRAINS,
         )
         assert config.language_backend == LanguageBackend.JETBRAINS
@@ -166,7 +183,7 @@ class TestProjectConfigLanguageBackend:
     def test_language_backend_roundtrips_through_yaml(self):
         config = ProjectConfig(
             project_name="test",
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
             language_backend=LanguageBackend.JETBRAINS,
         )
         d = config._to_yaml_dict()
@@ -175,7 +192,7 @@ class TestProjectConfigLanguageBackend:
     def test_language_backend_none_roundtrips_through_yaml(self):
         config = ProjectConfig(
             project_name="test",
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
         )
         d = config._to_yaml_dict()
         assert d["language_backend"] is None
@@ -208,16 +225,14 @@ def _make_config_with_project(
 ) -> tuple[SerenaConfig, str]:
     """Create a SerenaConfig with a single registered project and return (config, project_name)."""
     config = SerenaConfig(
-        gui_log_window=False,
-        web_dashboard=False,
         log_level=logging.ERROR,
         language_backend=global_backend,
-    )
+    ).with_headless_mode_overrides()
     project = Project(
         project_root=str(Path(__file__).parent.parent / "resources" / "repos" / "python" / "test_repo"),
         project_config=ProjectConfig(
             project_name=project_name,
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
             language_backend=language_backend,
         ),
         serena_config=config,
@@ -252,11 +267,9 @@ class TestEffectiveLanguageBackend:
     def test_no_project_uses_global_backend(self):
         """When no startup project is provided, effective backend is the global one."""
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             log_level=logging.ERROR,
             language_backend=LanguageBackend.LSP,
-        )
+        ).with_headless_mode_overrides()
         agent = SerenaAgent(project=None, serena_config=config)
         try:
             assert agent.get_language_backend() == LanguageBackend.LSP
@@ -273,7 +286,7 @@ class TestEffectiveLanguageBackend:
             project_root=str(Path(__file__).parent.parent / "resources" / "repos" / "java" / "test_repo"),
             project_config=ProjectConfig(
                 project_name="jb_proj",
-                languages=[Language.JAVA],
+                language_servers=[LanguageServerId.JAVA],
                 language_backend=LanguageBackend.JETBRAINS,
             ),
             serena_config=config,
@@ -296,7 +309,7 @@ class TestEffectiveLanguageBackend:
             project_root=str(Path(__file__).parent.parent / "resources" / "repos" / "python" / "test_repo"),
             project_config=ProjectConfig(
                 project_name="lsp_proj2",
-                languages=[Language.PYTHON],
+                language_servers=[LanguageServerId.PYTHON],
                 language_backend=LanguageBackend.LSP,
             ),
             serena_config=config,
@@ -319,7 +332,7 @@ class TestEffectiveLanguageBackend:
             project_root=str(Path(__file__).parent.parent / "resources" / "repos" / "python" / "test_repo"),
             project_config=ProjectConfig(
                 project_name="proj2",
-                languages=[Language.PYTHON],
+                language_servers=[LanguageServerId.PYTHON],
                 language_backend=None,
             ),
             serena_config=config,
@@ -338,90 +351,68 @@ class TestGetConfiguredProjectSerenaFolder:
     """Tests for SerenaConfig.get_configured_project_serena_folder (pure template resolution)."""
 
     def test_default_location(self):
-        config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
-        )
+        config = SerenaConfig().with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/home/user/myproject/.serena")
 
     def test_custom_location_with_project_folder_name(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/projects-metadata/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/projects-metadata/myproject/.serena")
 
     def test_custom_location_with_project_dir(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDir/.custom-serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/home/user/myproject/.custom-serena")
 
     def test_custom_location_with_both_placeholders(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/data/$projectFolderName/$projectDir/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/proj")
         assert result == os.path.abspath("/data/proj/home/user/proj/.serena")
 
     def test_default_field_value(self):
-        config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
-        )
+        config = SerenaConfig().with_headless_mode_overrides()
         assert config.project_serena_folder_location == DEFAULT_PROJECT_SERENA_FOLDER_LOCATION
 
     def test_rejects_unknown_placeholder(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDir/$unknownVar/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$unknownVar'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_rejects_typo_projectDirs(self):
         """$projectDirs should not be silently treated as $projectDir + 's'."""
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDirs/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$projectDirs'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_rejects_typo_projectfoldername_lowercase(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/data/$projectfoldername/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$projectfoldername'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_no_placeholders_is_valid(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/fixed/path/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/fixed/path/.serena")
 
     def test_error_message_lists_supported_placeholders(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$bogus/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"\$projectDir.*\$projectFolderName|\$projectFolderName.*\$projectDir"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
@@ -441,7 +432,7 @@ class TestProjectSerenaDataFolder:
     def _make_project(self, serena_config: "SerenaConfig | None" = None) -> Project:
         project_config = ProjectConfig(
             project_name="myproject",
-            languages=[Language.PYTHON],
+            language_servers=[LanguageServerId.PYTHON],
         )
         project = Project(
             project_root=str(self.project_path),
@@ -452,7 +443,7 @@ class TestProjectSerenaDataFolder:
         return project
 
     def test_default_config_creates_in_project_dir(self):
-        config = SerenaConfig(gui_log_window=False, web_dashboard=False)
+        config = SerenaConfig().with_headless_mode_overrides()
         project = self._make_project(config)
         expected = os.path.abspath(str(self.project_path / SERENA_MANAGED_DIR_NAME))
         assert project.path_to_serena_data_folder() == expected
@@ -461,10 +452,8 @@ class TestProjectSerenaDataFolder:
         custom_base = Path(self.test_dir) / "metadata"
         custom_base.mkdir()
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location=str(custom_base) + "/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         expected = os.path.abspath(str(custom_base / "myproject" / ".serena"))
         assert project.path_to_serena_data_folder() == expected
@@ -474,10 +463,8 @@ class TestProjectSerenaDataFolder:
         existing_serena = self.project_path / SERENA_MANAGED_DIR_NAME
         existing_serena.mkdir()
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/nonexistent/path/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         assert project.path_to_serena_data_folder() == str(existing_serena)
 
@@ -491,22 +478,49 @@ class TestProjectSerenaDataFolder:
         custom_serena.mkdir(parents=True)
 
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location=str(custom_base) + "/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         assert project.path_to_serena_data_folder() == str(custom_serena)
 
 
-class TestSerenaConfigFromConfigFileRobustness:
-    """Tests that ``SerenaConfig.from_config_file`` does not abort the whole
-    loader when a single registered project has a broken ``project.yml``.
+class TestProjectConfigYamlValidation:
+    def test_ignored_paths_globs_starting_with_star_require_quotes(self):
+        project_dir = Path(tempfile.mkdtemp())
+        try:
+            serena_dir = project_dir / SERENA_MANAGED_DIR_NAME
+            serena_dir.mkdir(parents=True)
+            (serena_dir / "project.yml").write_text('project_name: "demo"\nlanguages: ["csharp"]\nignored_paths:\n- **/bin/**\n')
+
+            with pytest.raises(ValueError) as exc_info:
+                ProjectConfig.load(project_dir, create_default_serena_config())
+
+            msg = str(exc_info.value)
+            assert "values that start with `*` must be quoted" in msg
+            assert "ignored_paths" in msg
+            assert '"**/bin/**"' in msg
+        finally:
+            shutil.rmtree(project_dir)
+
+
+class TestSerenaConfigLoadSave:
+    """
+    Supports tests of loading/saving SerenaConfig,
+    allowing to set up a temporary directory with a master config and multiple project directories.
     """
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        """
+        Sets up a temporary directory for testing, and monkeypatch SerenaConfig to use a test config file path.
+        """
         self.test_dir = Path(tempfile.mkdtemp())
         self.master_config_path = self.test_dir / "serena_config.yml"
+        monkeypatch.setattr(
+            SerenaConfig,
+            "_determine_config_file_path",
+            classmethod(lambda cls: str(self.master_config_path)),
+        )
 
     def teardown_method(self):
         shutil.rmtree(self.test_dir)
@@ -517,13 +531,19 @@ class TestSerenaConfigFromConfigFileRobustness:
         (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(project_yml_body)
         return project_dir
 
-    def _write_master_config(self, project_paths: list[Path]) -> None:
+    def _write_master_config(self, project_paths: list[Path | str]) -> None:
         body_lines = ["projects:"]
         for p in project_paths:
             body_lines.append(f"  - {p}")
         self.master_config_path.write_text("\n".join(body_lines) + "\n")
 
-    def test_malformed_project_is_skipped_with_warning(self, caplog, monkeypatch):
+    def test_empty_projects_key_is_treated_as_empty_list(self):
+        """A bare ``projects:`` key should not abort config loading."""
+        self.master_config_path.write_text("projects:\n")
+        config = SerenaConfig.from_config_file(generate_if_missing=False)
+        assert config.projects == []
+
+    def test_malformed_project_is_skipped_with_warning(self, caplog):
         """A malformed project.yml must not abort loading of the others."""
         good_project = self._make_project_dir(
             "good_project",
@@ -536,15 +556,6 @@ class TestSerenaConfigFromConfigFileRobustness:
         )
         self._write_master_config([good_project, bad_project])
 
-        # SerenaPaths is a process-wide singleton, so we cannot reliably
-        # redirect it via SERENA_HOME after the fact. Instead, redirect the
-        # config-file-path resolver directly.
-        monkeypatch.setattr(
-            SerenaConfig,
-            "_determine_config_file_path",
-            classmethod(lambda cls: str(self.master_config_path)),
-        )
-
         with caplog.at_level(logging.ERROR):
             config = SerenaConfig.from_config_file(generate_if_missing=False)
 
@@ -553,6 +564,130 @@ class TestSerenaConfigFromConfigFileRobustness:
         assert any("Failed to load project configuration" in msg and str(bad_project.resolve()) in msg for msg in caplog.messages), (
             f"Expected a warning naming {bad_project.resolve()}, got: {caplog.messages}"
         )
+
+    def test_alias_like_ignored_path_error_is_logged_with_hint(self, caplog):
+        good_project = self._make_project_dir(
+            "good_project",
+            'project_name: "good_project"\nlanguages: ["python"]\n',
+        )
+        bad_project = self._make_project_dir(
+            "bad_project",
+            'project_name: "bad_project"\nlanguages: ["csharp"]\nignored_paths:\n- **/bin/**\n',
+        )
+        self._write_master_config([good_project, bad_project])
+
+        with caplog.at_level(logging.ERROR):
+            config = SerenaConfig.from_config_file(generate_if_missing=False)
+
+        registered_roots = {Path(p.project_root).resolve() for p in config.projects}
+        assert registered_roots == {good_project.resolve()}
+        assert any("must be quoted" in msg and str(bad_project.resolve()) in msg for msg in caplog.messages), caplog.messages
+
+    def test_parallel_agents_changing_project_lists(self):
+        """
+        Tests that agents changing SerenaConfig by adding projects in parallel do not lose each other's changes.
+        """
+        p1 = self._make_project_dir("project1", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p2 = self._make_project_dir("project2", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p3 = self._make_project_dir("project3", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p4 = self._make_project_dir("project4", 'project_name: "project1"\nlanguages: ["python"]\n')
+
+        self._write_master_config([p1, p2])
+
+        config1 = SerenaConfig.from_config_file(generate_if_missing=False)
+        config2 = SerenaConfig.from_config_file(generate_if_missing=False)
+
+        config1.add_project_from_path(p3)
+        config2.add_project_from_path(p4)
+
+        resulting_config = SerenaConfig.from_config_file(generate_if_missing=False)
+
+        assert len(resulting_config.projects) == 4
+
+    def test_remove_project_persists_across_reload(self):
+        """Removing a project must update the on-disk project registry."""
+        p1 = self._make_project_dir("project1", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p2 = self._make_project_dir("project2", 'project_name: "project2"\nlanguages: ["python"]\n')
+        self._write_master_config([p1, p2])
+
+        config = SerenaConfig.from_config_file(generate_if_missing=False)
+        config.remove_project("project2")
+
+        reloaded = SerenaConfig.from_config_file(generate_if_missing=False)
+        assert [project.project_config.project_name for project in reloaded.projects] == ["project1"]
+
+    def test_remove_project_preserves_concurrent_addition(self):
+        """A removal must not discard a project added by another config instance."""
+        p1 = self._make_project_dir("project1", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p2 = self._make_project_dir("project2", 'project_name: "project2"\nlanguages: ["python"]\n')
+        p3 = self._make_project_dir("project3", 'project_name: "project3"\nlanguages: ["python"]\n')
+        self._write_master_config([p1, p2])
+
+        removing_config = SerenaConfig.from_config_file(generate_if_missing=False)
+        adding_config = SerenaConfig.from_config_file(generate_if_missing=False)
+        adding_config.add_project_from_path(p3)
+        removing_config.remove_project("project2")
+
+        reloaded = SerenaConfig.from_config_file(generate_if_missing=False)
+        assert {project.project_config.project_name for project in reloaded.projects} == {"project1", "project3"}
+
+    def test_add_project_preserves_concurrent_removal(self):
+        """An addition must not resurrect a project removed by another config instance."""
+        p1 = self._make_project_dir("project1", 'project_name: "project1"\nlanguages: ["python"]\n')
+        p2 = self._make_project_dir("project2", 'project_name: "project2"\nlanguages: ["python"]\n')
+        p3 = self._make_project_dir("project3", 'project_name: "project3"\nlanguages: ["python"]\n')
+        self._write_master_config([p1, p2])
+
+        removing_config = SerenaConfig.from_config_file(generate_if_missing=False)
+        adding_config = SerenaConfig.from_config_file(generate_if_missing=False)
+        removing_config.remove_project("project2")
+        adding_config.add_project_from_path(p3)
+
+        reloaded = SerenaConfig.from_config_file(generate_if_missing=False)
+        assert {project.project_config.project_name for project in reloaded.projects} == {"project1", "project3"}
+
+
+class TestGetRegisteredProjectWithDanglingProject:
+    """A registered project whose root directory was deleted (e.g. a removed git
+    worktree) must not break lookup/activation of other, valid projects.
+
+    Reproduces the bug where ``get_registered_project`` iterates over every
+    registered project and ``RegisteredProject.matches_root_path`` raises
+    ``FileNotFoundError`` for the dangling project, aborting the whole lookup.
+    """
+
+    def setup_method(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _make_project_dir(self, name: str) -> Path:
+        project_dir = self.test_dir / name
+        (project_dir / SERENA_MANAGED_DIR_NAME).mkdir(parents=True)
+        (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(f'project_name: "{name}"\nlanguages: ["python"]\n')
+        return project_dir
+
+    def test_dangling_project_does_not_break_lookup_of_valid_project(self):
+        config = create_default_serena_config()
+        dangling_dir = self._make_project_dir("dangling_project")
+        valid_dir = self._make_project_dir("valid_project")
+
+        # Register the dangling project FIRST so the path-matching loop hits the
+        # deleted directory before reaching the valid project.
+        config.projects = [
+            RegisteredProject.from_project_root(dangling_dir, serena_config=config),
+            RegisteredProject.from_project_root(valid_dir, serena_config=config),
+        ]
+
+        # Delete the dangling project's directory out from under Serena.
+        shutil.rmtree(dangling_dir)
+
+        # Looking up the valid project by path must succeed, not raise
+        # FileNotFoundError on the deleted dangling project's path.
+        result = config.get_registered_project(str(valid_dir))
+        assert result is not None
+        assert result.project_name == "valid_project"
 
 
 class TestMemoriesManagerCustomPath:
@@ -567,18 +702,66 @@ class TestMemoriesManagerCustomPath:
 
     def test_memories_subdir_is_created(self):
         assert not self.data_folder.exists()
-        MemoriesManager(str(self.data_folder))
+        MemoryManager(str(self.data_folder))
         assert (self.data_folder / "memories").exists()
 
     def test_save_and_load_memory(self):
-        manager = MemoriesManager(str(self.data_folder))
+        manager = MemoryManager(str(self.data_folder))
         manager.save_memory("test_topic", "test content", is_tool_context=False)
         content = manager.load_memory("test_topic")
         assert content == "test content"
 
     def test_list_memories(self):
-        manager = MemoriesManager(str(self.data_folder))
+        manager = MemoryManager(str(self.data_folder))
         manager.save_memory("topic_a", "content a", is_tool_context=False)
         manager.save_memory("topic_b", "content b", is_tool_context=False)
         memories = manager.list_project_memories()
         assert sorted(memories.get_full_list()) == ["topic_a", "topic_b"]
+
+
+class TestProjectConfigActivationCommand:
+    """Tests for the activation_command and activation_command_timeout fields."""
+
+    def _base_data(self) -> dict:
+        data, _ = ProjectConfig._load_yaml_dict(PROJECT_TEMPLATE_FILE)
+        data["project_name"] = "test"
+        data["languages"] = ["python"]
+        return data
+
+    def test_activation_command_defaults_to_none(self):
+        config = ProjectConfig(project_name="test", language_servers=[LanguageServerId.PYTHON])
+        assert config.activation_command is None
+
+    def test_activation_command_timeout_default(self):
+        config = ProjectConfig(project_name="test", language_servers=[LanguageServerId.PYTHON])
+        assert config.activation_command_timeout == 180.0
+
+    def test_activation_command_parsed_from_dict(self):
+        data = self._base_data()
+        data["activation_command"] = "npx nx run-many -t build"
+        data["activation_command_timeout"] = 300
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+        assert config.activation_command == "npx nx run-many -t build"
+        assert config.activation_command_timeout == 300.0
+
+    def test_activation_command_defaults_when_absent(self):
+        data = self._base_data()
+        data.pop("activation_command", None)
+        data.pop("activation_command_timeout", None)
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+        assert config.activation_command is None
+        assert config.activation_command_timeout == 180.0
+
+    def test_activation_command_timeout_zero_raises(self):
+        data = self._base_data()
+        data["activation_command"] = "echo hi"
+        data["activation_command_timeout"] = 0
+        with pytest.raises(ValueError, match="activation_command_timeout must be positive"):
+            ProjectConfig._from_dict(data, local_override_keys=[])
+
+    def test_activation_command_timeout_negative_raises(self):
+        data = self._base_data()
+        data["activation_command"] = "echo hi"
+        data["activation_command_timeout"] = -10
+        with pytest.raises(ValueError, match="activation_command_timeout must be positive"):
+            ProjectConfig._from_dict(data, local_override_keys=[])

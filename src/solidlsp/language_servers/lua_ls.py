@@ -7,8 +7,6 @@ You can pass the following entries in ``ls_specific_settings["lua"]``:
 """
 
 import logging
-import os
-import pathlib
 import platform
 import shutil
 from collections.abc import Hashable
@@ -17,10 +15,9 @@ from pathlib import Path
 from overrides import override
 
 from solidlsp.ls import RawDocumentSymbol, SolidLanguageServer
-from solidlsp.ls_config import Language, LanguageServerConfig
+from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_types import SymbolKind
 from solidlsp.ls_utils import FileUtils
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
 
@@ -94,7 +91,7 @@ class LuaLanguageServer(SolidLanguageServer):
         ]
 
         if solidlsp_settings is not None:
-            lua_settings = solidlsp_settings.get_ls_specific_settings(Language.LUA)
+            lua_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.LUA)
             lua_ls_version = lua_settings.get("lua_language_server_version", DEFAULT_LUA_LS_VERSION)
             ls_resource_dir = _lua_ls_install_dir(LuaLanguageServer.ls_resources_dir(solidlsp_settings), lua_ls_version)
             possible_paths.extend(
@@ -121,7 +118,7 @@ class LuaLanguageServer(SolidLanguageServer):
     @staticmethod
     def _download_lua_ls(solidlsp_settings: SolidLSPSettings) -> str:
         """Download and install lua-language-server if not present."""
-        lua_settings = solidlsp_settings.get_ls_specific_settings(Language.LUA)
+        lua_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.LUA)
         lua_ls_version = lua_settings.get("lua_language_server_version", DEFAULT_LUA_LS_VERSION)
         system = platform.system()
         machine = platform.machine().lower()
@@ -220,12 +217,10 @@ class LuaLanguageServer(SolidLanguageServer):
 
         return original_name
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the Lua Language Server.
         """
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
         initialize_params = {
             "locale": "en",
             "capabilities": {
@@ -270,15 +265,6 @@ class LuaLanguageServer(SolidLanguageServer):
                     },
                 },
             },
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
             "initializationOptions": {
                 # Lua Language Server specific options
                 "runtime": {
@@ -304,7 +290,7 @@ class LuaLanguageServer(SolidLanguageServer):
                 },
             },
         }
-        return initialize_params  # type: ignore[return-value]
+        return initialize_params
 
     def _start_server(self) -> None:
         """Start Lua Language Server process"""
@@ -325,7 +311,7 @@ class LuaLanguageServer(SolidLanguageServer):
 
         log.info("Starting Lua Language Server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from click import Command, Option
 from click.testing import CliRunner
 
 from serena.cli import ProjectCommands, TopLevelCommands, find_project_root
@@ -49,6 +50,14 @@ def temp_project_dir_with_python_file():
 def cli_runner():
     """Create a CliRunner for testing Click commands."""
     return CliRunner()
+
+
+@pytest.mark.parametrize("command", [ProjectCommands.create, ProjectCommands.index])
+def test_language_server_aliases_bind_to_language_parameter(command: Command) -> None:
+    language_option = next(option for option in command.params if isinstance(option, Option) and "--ls" in option.opts)
+
+    assert language_option.name == "language"
+    assert language_option.opts == ["--ls", "--language"]
 
 
 class TestProjectCreate:
@@ -245,13 +254,13 @@ class TestProjectCreateHelper:
         config = ProjectCommands._create_project(temp_project_dir_with_python_file, "my-project", ()).project_config
         assert isinstance(config, ProjectConfig)
         assert config.project_name == "my-project"
-        assert len(config.languages) >= 1
+        assert len(config.language_servers) >= 1
 
     def test_create_project_helper_with_languages(self, temp_project_dir):
         """Test _create_project with language specification."""
         config = ProjectCommands._create_project(temp_project_dir, None, ("python", "typescript")).project_config
         assert isinstance(config, ProjectConfig)
-        assert len(config.languages) >= 1
+        assert len(config.language_servers) >= 1
 
     def test_create_project_helper_file_exists_error(self, temp_project_dir):
         """Test _create_project raises error if project.yml exists."""
@@ -325,6 +334,33 @@ class TestFindProjectRoot:
             os.chdir(subdir)
             result = find_project_root(root=temp_project_dir)
             assert result is None
+        finally:
+            os.chdir(original_cwd)
+
+    def test_git_worktree_not_hijacked_by_ancestor_serena(self, temp_project_dir):
+        """A git worktree nested under a Serena project must resolve to the worktree.
+
+        Regression test: when a git worktree (whose .git is a pointer *file*) lives
+        below a directory that is an explicit Serena project (.serena/project.yml),
+        the worktree's own .git boundary must win over the ancestor's project marker.
+        The old two-pass search returned the ancestor Serena project, causing reads
+        and edits to land in the wrong working tree.
+        """
+        # Ancestor directory is an explicit Serena project.
+        serena_dir = os.path.join(temp_project_dir, ".serena")
+        os.makedirs(serena_dir)
+        Path(os.path.join(serena_dir, "project.yml")).touch()
+        # Nested git worktree: .git is a gitdir pointer file, as created by `git worktree add`.
+        worktree = os.path.join(temp_project_dir, "nested", "worktree")
+        os.makedirs(worktree)
+        Path(os.path.join(worktree, ".git")).write_text("gitdir: /repo/.git/worktrees/wt\n")
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(worktree)
+            result = find_project_root(root=temp_project_dir)
+            assert result is not None
+            assert os.path.samefile(result, worktree)
         finally:
             os.chdir(original_cwd)
 

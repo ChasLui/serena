@@ -5,7 +5,6 @@ Contains various configurations and settings specific to OCaml and Reason.
 
 import logging
 import os
-import pathlib
 import platform
 import re
 import shutil
@@ -18,10 +17,9 @@ from overrides import override
 
 from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
-from solidlsp.util.subprocess_util import subprocess_kwargs
+from solidlsp.util.subprocess_util import subprocess_kwargs, subprocess_run
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +61,7 @@ class OcamlLanguageServer(SolidLanguageServer):
         Raises RuntimeError if version cannot be determined.
         """
         try:
-            result = subprocess.run(
+            result = subprocess_run(
                 ["opam", "exec", "--", "ocaml", "-version"],
                 check=True,
                 capture_output=True,
@@ -113,7 +111,7 @@ class OcamlLanguageServer(SolidLanguageServer):
         Raises RuntimeError if version cannot be determined.
         """
         try:
-            result = subprocess.run(
+            result = subprocess_run(
                 ["opam", "list", "-i", "ocaml-lsp-server", "--columns=version", "--short"],
                 check=True,
                 capture_output=True,
@@ -150,7 +148,7 @@ class OcamlLanguageServer(SolidLanguageServer):
         """
         # Check if ocaml-lsp-server is installed
         try:
-            result = subprocess.run(
+            result = subprocess_run(
                 ["opam", "list", "-i", "ocaml-lsp-server"],
                 check=False,
                 capture_output=True,
@@ -178,7 +176,7 @@ class OcamlLanguageServer(SolidLanguageServer):
         # Find the executable path
         try:
             if platform.system() == "Windows":
-                result = subprocess.run(
+                result = subprocess_run(
                     ["opam", "exec", "--", "where", "ocamllsp"],
                     check=True,
                     capture_output=True,
@@ -188,7 +186,7 @@ class OcamlLanguageServer(SolidLanguageServer):
                 )
                 executable_path = result.stdout.strip().split("\n")[0]
             else:
-                result = subprocess.run(
+                result = subprocess_run(
                     ["opam", "exec", "--", "which", "ocamllsp"],
                     check=True,
                     capture_output=True,
@@ -254,7 +252,7 @@ class OcamlLanguageServer(SolidLanguageServer):
         """
         log.info("Building OCaml index for cross-file references (dune build @ocaml-index)...")
         try:
-            result = subprocess.run(
+            result = subprocess_run(
                 ["opam", "exec", "--", "dune", "build", "@ocaml-index"],
                 cwd=repository_root_path,
                 capture_output=True,
@@ -321,19 +319,13 @@ class OcamlLanguageServer(SolidLanguageServer):
         """Define language-specific directories to ignore for OCaml projects."""
         return super().is_ignored_dirname(dirname) or dirname in ["_build", "_opam", ".opam"]
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the OCaml Language Server.
         Supports both OCaml and Reason.
         """
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
         initialize_params = {
-            "processId": os.getpid(),
-            "clientInfo": {"name": "Serena", "version": "0.1.0"},
             "locale": "en",
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
             "capabilities": {
                 "workspace": {
                     "workspaceFolders": True,
@@ -376,14 +368,8 @@ class OcamlLanguageServer(SolidLanguageServer):
                 },
             },
             "trace": "verbose",
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
         }
-        return initialize_params  # type: ignore[return-value]
+        return initialize_params
 
     def _start_server(self) -> None:
         """
@@ -417,7 +403,7 @@ class OcamlLanguageServer(SolidLanguageServer):
 
         log.info("Starting OCaml LSP server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)

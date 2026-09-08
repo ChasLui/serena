@@ -22,12 +22,12 @@ from solidlsp.language_servers.typescript_language_server import (
     prefer_non_node_modules_definition,
 )
 from solidlsp.ls import LanguageServerDependencyProvider, LSPFileBuffer, SolidLanguageServer
-from solidlsp.ls_config import FilenameMatcher, Language, LanguageServerConfig
+from solidlsp.ls_config import FilenameMatcher, LanguageServerConfig, LanguageServerId
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_types import Location
 from solidlsp.ls_utils import PathUtils
 from solidlsp.lsp_protocol_handler import lsp_types
-from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, ExecuteCommandParams, InitializeParams, SymbolInformation
+from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, ExecuteCommandParams, SymbolInformation
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
 
@@ -39,19 +39,19 @@ class VueTypeScriptServer(TypeScriptLanguageServer):
 
     @classmethod
     @override
-    def get_language_enum_instance(cls) -> Language:
+    def get_language_server_id(cls) -> LanguageServerId:
         """Return TYPESCRIPT since this is a TypeScript language server variant.
 
         Note: VueTypeScriptServer is a companion server that uses TypeScript's language server
         with the Vue TypeScript plugin. It reports as TYPESCRIPT to maintain compatibility
         with the TypeScript language server infrastructure.
         """
-        return Language.TYPESCRIPT
+        return LanguageServerId.TYPESCRIPT
 
     def get_source_fn_matcher(self) -> FilenameMatcher:
         # must override with Vue-specific matcher to ensure .vue files are included (as they can be discovered via references,
         # for instance; otherwise, we may find references in .vue files but then filter the results out, because .vue files are ignored.)
-        return Language.VUE.get_source_fn_matcher()
+        return LanguageServerId.VUE.get_source_fn_matcher()
 
     class DependencyProvider(TypeScriptLanguageServer.DependencyProvider):
         """Dependency provider that returns a pre-resolved executable path.
@@ -121,8 +121,8 @@ class VueTypeScriptServer(TypeScriptLanguageServer):
         )
 
     @override
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        params = super()._get_initialize_params(repository_absolute_path)
+    def _create_base_initialize_params(self) -> dict:
+        params = super()._create_base_initialize_params()
 
         params["initializationOptions"] = {
             "plugins": [
@@ -176,6 +176,7 @@ class VueLanguageServer(SolidLanguageServer):
             ProcessLaunchInfo(cmd=vue_lsp_executable_path, cwd=repository_root_path),
             "vue",
             solidlsp_settings,
+            cache_version_raw_document_symbols=2,
         )
         self.server_ready = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
@@ -344,7 +345,7 @@ class VueLanguageServer(SolidLanguageServer):
                     continue
 
                 new_item: dict = {}
-                new_item.update(item)  # type: ignore[arg-type]
+                new_item.update(item)
                 new_item["absolutePath"] = str(abs_path)
                 new_item["relativePath"] = str(rel_path)
                 result.append(ls_types.Location(**new_item))  # type: ignore
@@ -390,7 +391,7 @@ class VueLanguageServer(SolidLanguageServer):
                     log.debug(f"Skipping invalid location item: {item}")
                     continue
 
-                abs_path = PathUtils.uri_to_path(item["uri"])  # type: ignore[arg-type]
+                abs_path = PathUtils.uri_to_path(item["uri"])
                 if not Path(abs_path).is_relative_to(self.repository_root_path):
                     log.warning(f"Found file reference outside repository: {abs_path}, skipping")
                     continue
@@ -401,7 +402,7 @@ class VueLanguageServer(SolidLanguageServer):
                     continue
 
                 new_item: dict = {}
-                new_item.update(item)  # type: ignore[arg-type]
+                new_item.update(item)
                 new_item["absolutePath"] = str(abs_path)
                 new_item["relativePath"] = str(rel_path)
                 ret.append(Location(**new_item))  # type: ignore
@@ -536,10 +537,10 @@ class VueLanguageServer(SolidLanguageServer):
         assert is_npm_installed, "npm is not installed or isn't in PATH. Please install npm and try again."
 
         # Get TypeScript version settings from TypeScript language server settings
-        typescript_config = solidlsp_settings.get_ls_specific_settings(Language.TYPESCRIPT)
+        typescript_config = solidlsp_settings.get_ls_specific_settings(LanguageServerId.TYPESCRIPT)
         typescript_version = typescript_config.get("typescript_version", "5.9.3")
         typescript_language_server_version = typescript_config.get("typescript_language_server_version", "5.1.3")
-        vue_config = solidlsp_settings.get_ls_specific_settings(Language.VUE)
+        vue_config = solidlsp_settings.get_ls_specific_settings(LanguageServerId.VUE)
         vue_language_server_version = vue_config.get("vue_language_server_version", "3.1.5")
         npm_registry = vue_config.get("npm_registry", typescript_config.get("npm_registry"))
 
@@ -617,8 +618,7 @@ class VueLanguageServer(SolidLanguageServer):
 
         return [vue_executable_path, "--stdio"], tsdk_path, ts_ls_executable_path
 
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
+    def _create_base_initialize_params(self) -> dict:
         initialize_params = {
             "locale": "en",
             "capabilities": {
@@ -644,15 +644,6 @@ class VueLanguageServer(SolidLanguageServer):
                     "symbol": {"dynamicRegistration": True},
                 },
             },
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
             "initializationOptions": {
                 "vue": {
                     "hybridMode": True,
@@ -662,14 +653,14 @@ class VueLanguageServer(SolidLanguageServer):
                 },
             },
         }
-        return initialize_params  # type: ignore
+        return initialize_params
 
     def _start_typescript_server(self) -> None:
         try:
             vue_ts_plugin_path = os.path.join(self._vue_ls_dir, "node_modules", "@vue", "typescript-plugin")
 
             ts_config = LanguageServerConfig(
-                code_language=Language.TYPESCRIPT,
+                ls_id=LanguageServerId.TYPESCRIPT,
                 trace_lsp_communication=False,
             )
 
@@ -811,7 +802,7 @@ class VueLanguageServer(SolidLanguageServer):
 
         log.info("Starting Vue server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to LSP server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)
@@ -878,7 +869,7 @@ class VueLanguageServer(SolidLanguageServer):
         return prefer_non_node_modules_definition(definitions)
 
     @override
-    def _request_document_symbols(
+    def _request_raw_document_symbols(
         self, relative_file_path: str, file_data: LSPFileBuffer | None
     ) -> list[SymbolInformation] | list[DocumentSymbol] | None:
         """
@@ -893,7 +884,7 @@ class VueLanguageServer(SolidLanguageServer):
         We filter out Property symbols that have a matching Variable with the same name
         at a different location (the definition), keeping only the definition.
         """
-        symbols = super()._request_document_symbols(relative_file_path, file_data)
+        symbols = super()._request_raw_document_symbols(relative_file_path, file_data)
 
         if symbols is None or len(symbols) == 0:
             return symbols

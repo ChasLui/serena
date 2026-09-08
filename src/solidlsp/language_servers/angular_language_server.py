@@ -69,8 +69,8 @@ from solidlsp.language_servers.typescript_language_server import (
 )
 from solidlsp.language_servers.vscode_html_language_server import VsCodeHtmlLanguageServer
 from solidlsp.ls import LanguageServerDependencyProvider, LSPFileBuffer, SolidLanguageServer
-from solidlsp.ls_config import FilenameMatcher, Language, LanguageServerConfig
-from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, InitializeParams, SymbolInformation
+from solidlsp.ls_config import FilenameMatcher, LanguageServerConfig, LanguageServerId
+from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, SymbolInformation
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
 
@@ -97,13 +97,13 @@ class AngularTypeScriptServer(TypeScriptLanguageServer):
 
     @classmethod
     @override
-    def get_language_enum_instance(cls) -> Language:
-        return Language.TYPESCRIPT
+    def get_language_server_id(cls) -> LanguageServerId:
+        return LanguageServerId.TYPESCRIPT
 
     def get_source_fn_matcher(self) -> FilenameMatcher:
         # Use the Angular matcher so .html template files aren't filtered out of
         # reference / search results when the companion is asked about them.
-        return Language.ANGULAR.get_source_fn_matcher()
+        return LanguageServerId.ANGULAR.get_source_fn_matcher()
 
     class DependencyProvider(TypeScriptLanguageServer.DependencyProvider):
         """Dependency provider that returns a pre-resolved executable path.
@@ -166,8 +166,8 @@ class AngularTypeScriptServer(TypeScriptLanguageServer):
         )
 
     @override
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        params = super()._get_initialize_params(repository_absolute_path)
+    def _create_base_initialize_params(self) -> dict:
+        params = super()._create_base_initialize_params()
         # Load @angular/language-service as a tsserver plugin via typescript-language-server's
         # initializationOptions.plugins API (the same API Vue uses for @vue/typescript-plugin).
         params["initializationOptions"] = {
@@ -293,8 +293,8 @@ class AngularLanguageServer(SolidLanguageServer):
         assert shutil.which("node") is not None, "node is not installed or isn't in PATH. Please install NodeJS and try again."
         assert shutil.which("npm") is not None, "npm is not installed or isn't in PATH. Please install npm and try again."
 
-        ng_settings = solidlsp_settings.get_ls_specific_settings(Language.ANGULAR)
-        ts_settings = solidlsp_settings.get_ls_specific_settings(Language.TYPESCRIPT)
+        ng_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.ANGULAR)
+        ts_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.TYPESCRIPT)
         ls_version = ng_settings.get("angular_language_server_version", DEFAULT_ANGULAR_LANGUAGE_SERVER_VERSION)
         svc_version = ng_settings.get("angular_language_service_version", DEFAULT_ANGULAR_LANGUAGE_SERVICE_VERSION)
         ts_version = ng_settings.get("typescript_version", ts_settings.get("typescript_version", DEFAULT_TYPESCRIPT_VERSION))
@@ -368,7 +368,7 @@ class AngularLanguageServer(SolidLanguageServer):
 
     def _start_typescript_server(self) -> None:
         try:
-            ts_config = LanguageServerConfig(code_language=Language.TYPESCRIPT, trace_lsp_communication=False)
+            ts_config = LanguageServerConfig(ls_id=LanguageServerId.TYPESCRIPT, trace_lsp_communication=False)
             log.info("Creating companion AngularTypeScriptServer")
             self._ts_server = AngularTypeScriptServer(
                 config=ts_config,
@@ -413,7 +413,7 @@ class AngularLanguageServer(SolidLanguageServer):
         non-fatal: we log and fall back to returning an empty list.
         """
         try:
-            html_config = LanguageServerConfig(code_language=Language.HTML, trace_lsp_communication=False)
+            html_config = LanguageServerConfig(ls_id=LanguageServerId.HTML, trace_lsp_communication=False)
             log.info("Creating companion VsCodeHtmlLanguageServer")
             self._html_server = VsCodeHtmlLanguageServer(
                 config=html_config,
@@ -502,8 +502,7 @@ class AngularLanguageServer(SolidLanguageServer):
         else:
             log.debug("Found @angular/core at %s", found)
 
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
+    def _create_base_initialize_params(self) -> dict:
         params: dict = {
             "locale": "en",
             "capabilities": {
@@ -531,17 +530,8 @@ class AngularLanguageServer(SolidLanguageServer):
                 "tsProbeLocations": [os.path.join(self._install_dir, "node_modules")],
                 "forceStrictTemplates": False,
             },
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
         }
-        return params  # type: ignore[return-value]
+        return params
 
     @override
     def _start_server(self) -> None:
@@ -580,7 +570,7 @@ class AngularLanguageServer(SolidLanguageServer):
         try:
             log.info("Starting Angular language server (ngserver)")
             self.server.start()
-            init_params = self._get_initialize_params(self.repository_root_path)
+            init_params = self._create_initialize_params()
             init_response = self.server.send.initialize(init_params)
             log.debug("Angular LS initialize response: %s", init_response)
             self.server.notify.initialized({})
@@ -621,22 +611,22 @@ class AngularLanguageServer(SolidLanguageServer):
     # ---------------------------------------------------------------------
 
     @override
-    def _request_document_symbols(
+    def _request_raw_document_symbols(
         self, relative_file_path: str, file_data: LSPFileBuffer | None
     ) -> list[SymbolInformation] | list[DocumentSymbol] | None:
         if self._ts_server is not None and self._is_typescript_file(relative_file_path):
             with self._ts_server.open_file(relative_file_path):
-                return self._ts_server._request_document_symbols(relative_file_path, file_data=None)
+                return self._ts_server._request_raw_document_symbols(relative_file_path, file_data=None)
         # ngserver returns -32601 for textDocument/documentSymbol on every .html file.
         # Route to the HTML companion which gives the structural element tree
         # (works on both plain HTML like index.html and Angular templates).
         if self._is_html_template_file(relative_file_path):
             if self._html_server is not None and self._html_server_started:
                 with self._html_server.open_file(relative_file_path):
-                    return self._html_server._request_document_symbols(relative_file_path, file_data=None)
+                    return self._html_server._request_raw_document_symbols(relative_file_path, file_data=None)
             log.debug("HTML companion unavailable for %s; returning None", relative_file_path)
             return None
-        return super()._request_document_symbols(relative_file_path, file_data)
+        return super()._request_raw_document_symbols(relative_file_path, file_data)
 
     @override
     def request_definition(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:

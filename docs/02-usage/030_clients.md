@@ -197,7 +197,7 @@ Claude Code settings file (`.claude/settings.json` in your project directory, or
                 ]
             }
         ],
-        "Stop": [
+        "SessionEnd": [
             {
                 "matcher": "",
                 "hooks": [
@@ -344,6 +344,17 @@ Then create `~/.codex/hooks.json` with the following content:
                 ]
             }
         ],
+        "PostToolUse": [
+            {
+                "matcher": "^mcp__serena__.*$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "serena-hooks reset --client=codex"
+                    }
+                ]
+            }
+        ],
         "SessionStart": [
             {
                 "matcher": "startup|resume",
@@ -355,7 +366,7 @@ Then create `~/.codex/hooks.json` with the following content:
                 ]
             }
         ],
-        "Stop": [
+        "SessionEnd": [
             {
                 "hooks": [
                     {
@@ -369,16 +380,109 @@ Then create `~/.codex/hooks.json` with the following content:
 }
 ```
 
+The `SessionEnd` cleanup hook requires Codex 0.145.0 or newer. Older Codex versions only support
+`Stop` for cleanup, which currently has a [known compatibility issue](https://github.com/oraios/serena/issues/1533).
+If you still configure it, replace `SessionEnd` with `Stop` in the example above. Configure cleanup
+under exactly one of these events, never both: `Stop` runs after every turn, while `SessionEnd` runs
+when Codex tears down the root thread.
+
 The hooks will:
 
 - **`activate`**: Prompt the agent to activate the current project and read Serena's instructions
   when a Codex session starts or resumes.
 - **`remind`**: Nudge the agent to use Serena's symbolic tools when it makes too many consecutive
   code-search or code-file-read calls without using Serena tools in between.
+- **`reset`**: Clear the reminder counters after a successful Serena symbolic tool call, so using
+  Serena's tools starts a fresh count instead of leaving the prior grep/read streak in place.
 - **`cleanup`**: Clean up hook session data when the session ends.
 
-The `PreToolUse` matcher is intentionally restricted to `Bash`. The Serena reminder hook for Codex
-tracks shell-based grep and code-file reads, so running it for every tool call is unnecessary.
+The `PreToolUse` matcher is intentionally restricted to `Bash`: the reminder hook tracks shell-based
+grep and code-file reads, so running it for every tool call is unnecessary. That matcher never sees
+`mcp__serena__*` tool names, though, so it cannot also perform the counter reset on Serena tool use
+the way it does for clients whose `PreToolUse` hook observes every tool call. The separate `reset`
+hook above, matched to `PostToolUse` on Serena's own tools, covers that case for Codex instead.
+
+## Grok
+
+Serena provides native support for xAI's Grok Build CLI. To set up the Serena MCP server for Grok,
+simply run:
+
+    serena setup grok
+
+### Manual Setup
+
+**Global Configuration**. To add the Serena MCP server for all your projects, use Grok's user-level configuration and the `--project-from-cwd` flag:
+
+```bash
+grok mcp add --scope user serena -- serena start-mcp-server --context=grok --project-from-cwd
+```
+
+Alternatively, add the following to `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.serena]
+command = "serena"
+args = ["start-mcp-server", "--project-from-cwd", "--context=grok"]
+```
+
+**Project-Level Configuration**. To add the Serena MCP server for a single project only:
+
+```bash
+grok mcp add --scope project serena -- serena start-mcp-server --context=grok --project "$(pwd)"
+```
+
+**Verification.**
+Run `grok inspect` and verify that Serena is listed as an MCP server. You can also use Grok's `/mcps`
+modal to inspect, refresh, enable, or disable configured MCP servers.
+
+Grok can also load existing Claude Code MCP configuration. If you previously ran `serena setup claude-code`,
+Serena may already appear in Grok, but it will use the `claude-code` context instead of the dedicated `grok` context.
+
+### Hooks
+
+Grok supports lifecycle hooks; see Grok's bundled hooks documentation for details. To enable Serena's hooks
+for Grok globally, create `~/.grok/hooks/serena-hooks.json` with the following content. For a single project,
+create `.grok/hooks/serena-hooks.json` in that project instead; note that Grok loads project-scoped hooks
+only after you have trusted the project for hook execution (via Grok's `/hooks-trust` command).
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "grep|read_file|run_terminal_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks remind --client=grok",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks cleanup --client=grok",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hooks will:
+
+- **`remind`**: Nudge the agent to use Serena's symbolic tools when it makes too many consecutive
+  code-search or code-file-read calls without using Serena tools in between.
+- **`cleanup`**: Clean up hook session data when the agent turn ends.
+
+Grok ignores stdout from passive hooks such as `SessionStart`, so the Grok hook setup intentionally
+uses only `PreToolUse` for reminders and `Stop` for cleanup.
 
 ## Claude Desktop
 
@@ -397,7 +501,7 @@ Add the `serena` MCP server configuration
       "command": "serena",
       "args": [
         "start-mcp-server",
-        "--context=claude-desktop"
+        "--context=desktop-app"
       ]
     }
   }
@@ -525,6 +629,93 @@ You will have to prompt Antigravity's agent to "Activate the current project usi
 Unlike VSCode, Antigravity does not currently support including the working directory in the MCP configuration.
 Also, the current client will be shown as `none` in Serena's dashboard (Antigravity currently does not fully support the MCP specifications). This is not a problem, all tools will work as expected.
 
+## CodeBuddy
+
+Serena provides native support for CodeBuddy, a CLI coding agent that shares a similar architecture with Claude Code.
+To set up the Serena MCP server for CodeBuddy, simply run:
+
+    serena setup codebuddy
+
+### Manual Setup
+
+**Global Configuration**. To add the Serena MCP server for all your projects, use the user-level configuration of CodeBuddy and the `--project-from-cwd` flag:
+
+```bash
+codebuddy mcp add --scope user serena -- serena start-mcp-server --context codebuddy --project-from-cwd
+```
+
+**Project-Level Configuration**. To add the Serena MCP server for a single project only:
+
+```bash
+codebuddy mcp add serena -- serena start-mcp-server --context codebuddy --project "$(pwd)"
+```
+
+Confirm that CodeBuddy is connected to Serena by running the `/mcp` command and reconnecting if necessary.
+
+### Hooks
+
+CodeBuddy supports the same hook system as Claude Code. To set up hooks, add the following to your CodeBuddy settings file (`.codebuddy/settings.json` in your project directory, or `~/.codebuddy/settings.json` globally):
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks remind --client=codebuddy"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks auto-approve --client=codebuddy"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks activate --client=codebuddy"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "serena-hooks cleanup --client=codebuddy"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Hook Descriptions
+
+- **`remind`**: Remind the agent to use Serena's tools instead of built-in `grep` and `read` tools.
+- **`activate`**: Prompt the agent to activate the project at session start and read Serena's instructions.
+- **`cleanup`**: Clean up hook session data when the session ends.
+- **`auto-approve`**: Auto-approve Serena tool calls whenever CodeBuddy is in a permissive
+  permission mode (`acceptEdits` or `auto`), so blanket approvals cover Serena's destructive
+  tools (e.g. `replace_symbol_body`, `rename_symbol`) instead of prompting on every call.
+
 ## Other Clients
 
 For other clients, follow the [general instructions](#clients-general-instructions) above to set up Serena as an MCP server.
@@ -536,8 +727,9 @@ There are many terminal-based coding assistants that support MCP servers, such a
  * [Gemini-CLI](https://github.com/google-gemini/gemini-cli), 
  * [Qwen3-Coder](https://github.com/QwenLM/Qwen3-Coder),
  * [rovodev](https://community.atlassian.com/forums/Rovo-for-Software-Teams-Beta/Introducing-Rovo-Dev-CLI-AI-Powered-Development-in-your-terminal/ba-p/3043623),
- * [OpenHands CLI](https://docs.all-hands.dev/usage/how-to/cli-mode) and
- * [opencode](https://github.com/sst/opencode).
+ * [OpenHands CLI](https://docs.all-hands.dev/usage/how-to/cli-mode),
+ * [opencode](https://github.com/sst/opencode) and
+ * [CodeBuddy-Code](https://www.codebuddy.cn/cli/).
 
 They generally benefit from the symbolic tools provided by Serena. You might want to customize some aspects of Serena
 by writing your own context, modes or prompts to adjust it to the client's respective internal capabilities (and your general workflow).

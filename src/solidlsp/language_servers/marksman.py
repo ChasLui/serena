@@ -5,7 +5,6 @@ Contains various configurations and settings specific to Markdown.
 
 import logging
 import os
-import pathlib
 from collections.abc import Hashable
 
 from overrides import override
@@ -19,7 +18,6 @@ from solidlsp.ls import (
 )
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_types import SymbolKind, UnifiedSymbolInformation
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
 
 from .common import RuntimeDependency, RuntimeDependencyCollection
@@ -171,16 +169,16 @@ class Marksman(SolidLanguageServer):
         return request_document_symbols_override_version
 
     @override
-    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
-        """Override to remap Marksman's heading symbol kinds from String to Namespace.
+    def _build_document_symbols_from_raw_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer) -> DocumentSymbols:
+        # Override to remap Marksman's heading symbol kinds from String to Namespace.
+        #
+        # Marksman LSP returns all markdown headings (h1-h6) with SymbolKind.String (15).
+        # This is problematic because String (15) >= Variable (13), so headings are
+        # classified as "low-level" and filtered out of symbol overviews.
+        # Remapping to Namespace (3) fixes this and is semantically appropriate
+        # (headings are named sections containing other content).
 
-        Marksman LSP returns all markdown headings (h1-h6) with SymbolKind.String (15).
-        This is problematic because String (15) >= Variable (13), so headings are
-        classified as "low-level" and filtered out of symbol overviews.
-        Remapping to Namespace (3) fixes this and is semantically appropriate
-        (headings are named sections containing other content).
-        """
-        document_symbols = super().request_document_symbols(relative_file_path, file_buffer=file_buffer)
+        document_symbols = super()._build_document_symbols_from_raw_symbols(relative_file_path, file_buffer=file_buffer)
 
         # NOTE: When changing this method, also update the cache fingerprint method above
 
@@ -195,17 +193,12 @@ class Marksman(SolidLanguageServer):
 
         return document_symbols
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the Marksman Language Server.
         """
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
-        initialize_params: InitializeParams = {  # type: ignore
-            "processId": os.getpid(),
+        initialize_params: dict = {
             "locale": "en",
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
             "capabilities": {
                 "textDocument": {
                     "synchronization": {"didSave": True, "dynamicRegistration": True},
@@ -215,9 +208,9 @@ class Marksman(SolidLanguageServer):
                     "documentSymbol": {
                         "dynamicRegistration": True,
                         "hierarchicalDocumentSymbolSupport": True,
-                        "symbolKind": {"valueSet": list(range(1, 27))},  # type: ignore[arg-type]
+                        "symbolKind": {"valueSet": list(range(1, 27))},
                     },
-                    "hover": {"dynamicRegistration": True, "contentFormat": ["markdown", "plaintext"]},  # type: ignore[list-item]
+                    "hover": {"dynamicRegistration": True, "contentFormat": ["markdown", "plaintext"]},
                     "codeAction": {"dynamicRegistration": True},
                 },
                 "workspace": {
@@ -226,12 +219,6 @@ class Marksman(SolidLanguageServer):
                     "symbol": {"dynamicRegistration": True},
                 },
             },
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(repository_absolute_path),
-                }
-            ],
         }
         return initialize_params
 
@@ -256,7 +243,7 @@ class Marksman(SolidLanguageServer):
 
         log.info("Starting marksman server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info("Sending initialize request from LSP client to marksman server and awaiting response")
         init_response = self.server.send.initialize(initialize_params)
